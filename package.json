@@ -9,17 +9,24 @@
   },
   "scripts": {
     "compile": "hardhat compile",
+    "abi": "node scripts/generate-abi.js",
     "test": "hardhat test",
-    "test:sdk": "node --test sdk/test/",
+    "test:sdk": "node --test sdk/test/portaldot.test.mjs",
     "preflight": "node scripts/preflight.js",
     "deploy:testnet": "hardhat run scripts/deploy.js --network portaldotTestnet",
+    "bind:testnet": "hardhat run scripts/bind.js --network portaldotTestnet",
     "verify:deployment": "node scripts/verify-deployment.js",
     "dual:read": "node scripts/dual-read.js",
-    "check": "npm run compile && npm run test && npm run test:sdk"
+    "app": "npm run build:app && node scripts/serve-app.js",
+    "build:app": "esbuild app/app.js --bundle --format=esm --outfile=app/bundle.js --platform=browser --target=es2022",
+    "check": "npm run compile && npm run abi && npm run test && npm run test:sdk"
   },
   "devDependencies": {
+    "@nomicfoundation/hardhat-chai-matchers": "^2.1.2",
     "@nomicfoundation/hardhat-ethers": "^3.0.8",
     "@nomicfoundation/hardhat-network-helpers": "^1.0.12",
+    "chai": "^4.5.0",
+    "esbuild": "^0.28.2",
     "ethers": "^6.13.4",
     "hardhat": "^2.22.17"
   },

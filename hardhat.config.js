@@ -1,5 +1,6 @@
 require('@nomicfoundation/hardhat-ethers');
 require('@nomicfoundation/hardhat-network-helpers');
+require('@nomicfoundation/hardhat-chai-matchers');
 
 const PORTALDOT_TESTNET_EVM_RPC = 'https://test-evm-rpc-v3.portaldot.dev';
 const PORTALDOT_TESTNET_NODE_WS = 'wss://test-node-v3.portaldot.dev';
