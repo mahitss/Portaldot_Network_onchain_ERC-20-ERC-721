@@ -15,6 +15,8 @@
     "preflight": "node scripts/preflight.js",
     "deploy:testnet": "hardhat run scripts/deploy.js --network portaldotTestnet",
     "init:deployer": "node scripts/init-deployer.js",
+    "check:funding": "node scripts/check-funding.js",
+    "release:testnet": "npm run deploy:testnet && npm run bind:testnet && npm run verify:deployment",
     "estimate:deploy": "node scripts/estimate-deploy-cost.js",
     "bind:testnet": "hardhat run scripts/bind.js --network portaldotTestnet",
     "verify:deployment": "node scripts/verify-deployment.js",

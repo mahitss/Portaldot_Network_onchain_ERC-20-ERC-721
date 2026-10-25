@@ -27,8 +27,8 @@ async function main() {
     `file://${path.join(path.resolve(__dirname, '..'), 'shared', 'portaldot.mjs').replace(/\\/g, '/')}`
   );
 
-  const assetId = Number(process.env.POT_NATIVE_ASSET_ID || 0);
-  const nftId = Number(process.env.POT_NATIVE_NFT_ID || 0);
+  const assetId = Number(process.env.POT_NATIVE_ASSET_ID || 1);
+  const nftId = Number(process.env.POT_NATIVE_NFT_ID || 1);
   const nativeAccount = process.env.POT_NATIVE_ACCOUNT || deployments.deployer;
   const hash = process.env.POT_NATIVE_ACCOUNT_HASH || (await nativeAccountHash(nativeAccount));
 
@@ -57,6 +57,9 @@ async function main() {
   if (assetId === 0 && nftId === 0) {
     process.stdout.write('set POT_NATIVE_ASSET_ID and/or POT_NATIVE_NFT_ID to bind\n');
   }
+
+  const bindingCount = Number(await registry.bindingCount());
+  process.stdout.write(`registry binding count ${bindingCount}\n`);
 }
 
 main().catch((error) => {
