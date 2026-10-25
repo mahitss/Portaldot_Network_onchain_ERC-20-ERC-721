@@ -2,6 +2,28 @@ require('@nomicfoundation/hardhat-ethers');
 require('@nomicfoundation/hardhat-network-helpers');
 require('@nomicfoundation/hardhat-chai-matchers');
 
+const fs = require('node:fs');
+const path = require('node:path');
+
+const envFile = path.resolve(__dirname, '.env');
+if (fs.existsSync(envFile)) {
+  for (const line of fs.readFileSync(envFile, 'utf8').split('\n')) {
+    const entry = line.trim();
+    if (!entry || entry.startsWith('#')) {
+      continue;
+    }
+    const separator = entry.indexOf('=');
+    if (separator < 0) {
+      continue;
+    }
+    const key = entry.slice(0, separator).trim();
+    const value = entry.slice(separator + 1).trim();
+    if (process.env[key] === undefined) {
+      process.env[key] = value;
+    }
+  }
+}
+
 const PORTALDOT_TESTNET_EVM_RPC = 'https://test-evm-rpc-v3.portaldot.dev';
 const PORTALDOT_TESTNET_NODE_WS = 'wss://test-node-v3.portaldot.dev';
 const PORTALDOT_V3_CHAIN_ID = 420420777;

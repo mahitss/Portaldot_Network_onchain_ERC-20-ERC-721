@@ -14,6 +14,7 @@
     "test:sdk": "node --test sdk/test/portaldot.test.mjs",
     "preflight": "node scripts/preflight.js",
     "deploy:testnet": "hardhat run scripts/deploy.js --network portaldotTestnet",
+    "init:deployer": "node scripts/init-deployer.js",
     "estimate:deploy": "node scripts/estimate-deploy-cost.js",
     "bind:testnet": "hardhat run scripts/bind.js --network portaldotTestnet",
     "verify:deployment": "node scripts/verify-deployment.js",
