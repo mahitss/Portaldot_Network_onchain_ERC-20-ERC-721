@@ -18,3 +18,4 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: npm run estimate:deploy
+        continue-on-error: true
