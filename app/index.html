@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PotToken Console</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header>
+      <h1>PotToken Console</h1>
+      <p class="subtitle">Portaldot V3 dual ledger view for ERC-20 and ERC-721</p>
+      <div class="network" id="network">connecting to chain 420420777</div>
+    </header>
+
+    <main>
+      <section class="panel">
+        <h2>Chain and contracts</h2>
+        <div id="chain-status" class="grid"></div>
+        <div id="contract-status" class="grid"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Token state</h2>
+        <div id="token-state" class="grid"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Native account mapping</h2>
+        <form id="mapping-form">
+          <label for="evm-address">EVM address</label>
+          <input id="evm-address" name="evm-address" value="0xf7eC65d11e35375A250e474059a917B537804142" />
+          <button type="submit">Map</button>
+        </form>
+        <div id="mapping-result" class="grid"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Unit conversion</h2>
+        <form id="conversion-form">
+          <label for="amount">Amount</label>
+          <input id="amount" name="amount" value="1" />
+          <button type="submit">Convert</button>
+        </form>
+        <div id="conversion-result" class="grid"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Holder balances</h2>
+        <form id="balance-form">
+          <label for="holder">Holder address</label>
+          <input id="holder" name="holder" value="0xf7eC65d11e35375A250e474059a917B537804142" />
+          <button type="submit">Read</button>
+        </form>
+        <div id="balance-result" class="grid"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Registry bindings</h2>
+        <div id="binding-result" class="grid"></div>
+      </section>
+    </main>
+
+    <footer>
+      <span>chain 420420777</span>
+      <span>rpc https://test-evm-rpc-v3.portaldot.dev</span>
+      <span>native decimals 14</span>
+      <span>evm decimals 18</span>
+    </footer>
+
+    <script type="module" src="./bundle.js"></script>
+  </body>
+</html>

@@ -11,5 +11,8 @@ npm-debug.log*
 .DS_Store
 Thumbs.db
 deployments/local/
+deployments/localhost.json
+deployments/hardhat.json
+app/bundle.js
 .vscode/
 .idea/
