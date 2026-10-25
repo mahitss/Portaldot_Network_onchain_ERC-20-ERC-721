@@ -139,20 +139,21 @@ npm run bind:testnet
 
 ## Deployment cost
 
-The deployment cost is dominated by the code deposit, so the suite is compiled with the viaIR
-pipeline and a single optimizer run to keep the runtime bytecode small. Measured on the live
-testnet with `eth_estimateGas` at the 31,270 wei base fee:
+The deployment cost is dominated by the code deposit, so the suite is compiled with solc 0.8.24,
+cancun evm version and optimizer 200 runs (no viaIR). Measured on the live testnet with
+`eth_estimateGas` at the 31,000 wei base fee:
 
 | Contract | Creation bytes | Runtime bytes | Cost |
 | --- | --- | --- | --- |
-| `PotERC20` | 4,058 | 2,775 | ≈ 249.18 tPOT |
-| `PotERC721` | 5,799 | 4,517 | ≈ 391.25 tPOT |
-| `PotRegistry` | 3,284 | 3,201 | ≈ 271.14 tPOT |
-| **Total** | 13,141 | 10,493 | **≈ 911.57 tPOT** |
+| `PotERC20` | 4,457 | 3,284 | ≈ 289.54 tPOT |
+| `PotERC721` | 6,590 | 5,412 | ≈ 397.50 tPOT |
+| `PotRegistry` | 4,885 | 4,794 | ≈ 462.23 tPOT |
+| **Total** | 15,932 | 13,490 | **≈ 1,149.27 tPOT** |
 
-Request at least **1,050 tPOT** for the deployer account. The same estimates at the 32,580 wei
-price seen earlier in the chain history come to ≈ 949.76 tPOT. `npm run estimate:deploy` refreshes
-the numbers against the live base fee.
+Per-contract runtime is under the 10,240 byte Revive limit. Request at least **1,300 tPOT** for
+the deployer account; at the 32,580 wei base fees seen earlier in the chain history the same
+deployment costs ≈ 1,198 tPOT. `npm run estimate:deploy` refreshes the numbers against the live
+base fee.
 
 ## Platform facts
 

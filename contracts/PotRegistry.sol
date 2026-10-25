@@ -8,6 +8,10 @@ contract PotRegistry {
     uint16 public constant NATIVE_ASSETS = 1;
     uint16 public constant NATIVE_NFTS = 2;
 
+    bytes4 private constant ERC165_INTERFACE_ID = 0x01ffc9a7;
+    bytes4 private constant ERC721_INTERFACE_ID = 0x80ac58cd;
+    uint8 private constant MAX_DECIMAL_DIFFERENCE = 38;
+
     struct Binding {
         address token;
         uint8 tokenKind;
@@ -25,6 +29,7 @@ contract PotRegistry {
     uint256 public bindingCount;
     mapping(uint256 => Binding) private _bindings;
     mapping(address => uint256) public bindingIdOf;
+    mapping(uint16 => mapping(uint32 => uint256)) public bindingIdOfNative;
 
     event TokenBound(
         uint256 indexed bindingId,
@@ -48,6 +53,9 @@ contract PotRegistry {
     error InvalidNativeKind();
     error InvalidNativeId();
     error InvalidDecimals();
+    error InvalidCommitment();
+    error NativeIdAlreadyBound();
+    error PrecisionLoss();
 
     constructor() {
         owner = msg.sender;
@@ -71,9 +79,13 @@ contract PotRegistry {
         if (token == address(0)) revert ZeroAddress();
         if (tokenKind > KIND_ERC721) revert InvalidTokenKind();
         if (nativeKind > NATIVE_NFTS) revert InvalidNativeKind();
+        if (nativeKind == NATIVE_NONE && nativeId != 0) revert InvalidNativeId();
         if (nativeKind != NATIVE_NONE && nativeId == 0) revert InvalidNativeId();
-        if (evmDecimals < nativeDecimals) revert InvalidDecimals();
+        if (nativeDecimals > evmDecimals) revert InvalidDecimals();
+        if (evmDecimals - nativeDecimals > MAX_DECIMAL_DIFFERENCE) revert InvalidDecimals();
         if (bindingIdOf[token] != 0) revert TokenAlreadyBound();
+        if (nativeKind != NATIVE_NONE && bindingIdOfNative[nativeKind][nativeId] != 0) revert NativeIdAlreadyBound();
+        if (nativeAccountHash == bytes32(0)) revert InvalidCommitment();
 
         uint128 factor = uint128(10 ** uint256(evmDecimals - nativeDecimals));
         bindingId = bindingCount + 1;
@@ -93,6 +105,9 @@ contract PotRegistry {
         });
 
         bindingIdOf[token] = bindingId;
+        if (nativeKind != NATIVE_NONE) {
+            bindingIdOfNative[nativeKind][nativeId] = bindingId;
+        }
 
         emit TokenBound(
             bindingId,
@@ -110,9 +125,14 @@ contract PotRegistry {
     function unbind(uint256 bindingId) external onlyOwner {
         Binding storage binding = _bindings[bindingId];
         if (binding.token == address(0)) revert UnknownBinding();
+        address token = binding.token;
         binding.active = false;
-        delete bindingIdOf[binding.token];
-        emit TokenUnbound(bindingId, binding.token);
+        binding.token = address(0);
+        delete bindingIdOf[token];
+        if (binding.nativeKind != NATIVE_NONE) {
+            delete bindingIdOfNative[binding.nativeKind][binding.nativeId];
+        }
+        emit TokenUnbound(bindingId, token);
     }
 
     function transferOwnership(address newOwner) external onlyOwner {
@@ -141,6 +161,7 @@ contract PotRegistry {
     function convertToNative(uint256 bindingId, uint256 evmAmount) external view returns (uint256) {
         Binding memory binding = _bindings[bindingId];
         if (binding.token == address(0)) revert UnknownBinding();
+        if (evmAmount % binding.conversionFactor != 0) revert PrecisionLoss();
         return evmAmount / binding.conversionFactor;
     }
 

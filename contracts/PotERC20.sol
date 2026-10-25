@@ -27,6 +27,9 @@ contract PotERC20 {
     error ZeroAmount();
     error InsufficientBalance();
     error InsufficientAllowance();
+    error NotERC165();
+
+    bytes4 private constant ERC165_INTERFACE_ID = 0x01ffc9a7;
 
     constructor(string memory tokenName, string memory tokenSymbol, address tokenIssuer) {
         owner = msg.sender;
@@ -92,6 +95,10 @@ contract PotERC20 {
         if (newOwner == address(0)) revert ZeroAddress();
         emit OwnershipTransferred(owner, newOwner);
         owner = newOwner;
+    }
+
+    function supportsInterface(bytes4 interfaceId) external pure returns (bool) {
+        return interfaceId == ERC165_INTERFACE_ID;
     }
 
     function transfer(address to, uint256 amount) external whenNotPaused returns (bool) {

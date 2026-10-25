@@ -13,6 +13,14 @@ describe('PotERC20', function () {
     return { token, owner, issuer, alice, bob, spender };
   }
 
+  async function sumBalances(token, holders) {
+    let total = 0n;
+    for (const h of holders) {
+      total += await token.balanceOf(h);
+    }
+    return total;
+  }
+
   it('exposes standard metadata and roles', async function () {
     const { token, owner, issuer } = await deploy();
     assert.equal(await token.name(), 'Portaldot Test Token');
@@ -22,6 +30,18 @@ describe('PotERC20', function () {
     assert.equal(await token.issuer(), issuer.address);
     assert.equal(await token.totalSupply(), 0n);
     assert.equal(await token.isPaused(), false);
+  });
+
+  it('initial supply invariant holds before and after mint', async function () {
+    const { token, issuer, alice, bob } = await deploy();
+    const holders = [alice.address, bob.address];
+    assert.equal(await sumBalances(token, holders), 0n);
+    assert.equal(await token.totalSupply(), 0n);
+
+    const amount = ethers.parseUnits('100', 18);
+    await token.connect(issuer).mint(alice.address, amount);
+    assert.equal(await sumBalances(token, holders), amount);
+    assert.equal(await token.totalSupply(), amount);
   });
 
   it('lets the issuer mint and emits a mint transfer', async function () {
@@ -54,7 +74,7 @@ describe('PotERC20', function () {
     );
   });
 
-  it('transfers and moves balances', async function () {
+  it('transfers and moves balances with events', async function () {
     const { token, issuer, alice, bob } = await deploy();
     const amount = ethers.parseUnits('10', 18);
     await token.connect(issuer).mint(alice.address, amount);
@@ -66,11 +86,19 @@ describe('PotERC20', function () {
     assert.equal(await token.totalSupply(), amount);
   });
 
-  it('rejects transfers above balance', async function () {
+  it('rejects transfers above balance, zero amount and zero recipient', async function () {
     const { token, alice, bob } = await deploy();
     await expect(token.connect(alice).transfer(bob.address, 1n)).to.be.revertedWithCustomError(
       token,
       'InsufficientBalance'
+    );
+    await expect(token.connect(alice).transfer(bob.address, 0n)).to.be.revertedWithCustomError(
+      token,
+      'ZeroAmount'
+    );
+    await expect(token.connect(alice).transfer(ZERO, 1n)).to.be.revertedWithCustomError(
+      token,
+      'ZeroAddress'
     );
   });
 
@@ -82,13 +110,27 @@ describe('PotERC20', function () {
     await token.connect(alice).approve(spender.address, allowanceAmount);
     assert.equal(await token.allowance(alice.address, spender.address), allowanceAmount);
 
-    await token.connect(spender).transferFrom(alice.address, bob.address, ethers.parseUnits('15', 18));
+    await expect(token.connect(spender).transferFrom(alice.address, bob.address, ethers.parseUnits('15', 18)))
+      .to.emit(token, 'Approval')
+      .withArgs(alice.address, spender.address, ethers.parseUnits('25', 18));
     assert.equal(await token.balanceOf(bob.address), ethers.parseUnits('15', 18));
     assert.equal(await token.allowance(alice.address, spender.address), ethers.parseUnits('25', 18));
 
     await expect(
       token.connect(spender).transferFrom(alice.address, bob.address, ethers.parseUnits('50', 18))
     ).to.be.revertedWithCustomError(token, 'InsufficientAllowance');
+  });
+
+  it('rejects transferFrom without approval and with zero recipient', async function () {
+    const { token, issuer, alice, bob, spender } = await deploy();
+    await token.connect(issuer).mint(alice.address, ethers.parseUnits('10', 18));
+    await expect(
+      token.connect(spender).transferFrom(alice.address, bob.address, 1n)
+    ).to.be.revertedWithCustomError(token, 'InsufficientAllowance');
+    await token.connect(alice).approve(spender.address, ethers.parseUnits('10', 18));
+    await expect(
+      token.connect(spender).transferFrom(alice.address, ZERO, 1n)
+    ).to.be.revertedWithCustomError(token, 'ZeroAddress');
   });
 
   it('keeps an infinite allowance intact', async function () {
@@ -101,7 +143,7 @@ describe('PotERC20', function () {
   });
 
   it('allows the holder, issuer and owner to burn', async function () {
-    const { token, owner, issuer, alice, bob } = await deploy();
+    const { token, owner, issuer, alice } = await deploy();
     const minted = ethers.parseUnits('20', 18);
     await token.connect(issuer).mint(alice.address, minted);
 
@@ -116,33 +158,49 @@ describe('PotERC20', function () {
     assert.equal(await token.balanceOf(alice.address), 0n);
   });
 
-  it('rejects burning by an unrelated account and above balance', async function () {
+  it('rejects burning by an unrelated account, zero amount and above balance', async function () {
     const { token, issuer, alice, bob } = await deploy();
     await token.connect(issuer).mint(alice.address, ethers.parseUnits('10', 18));
     await expect(token.connect(bob).burn(alice.address, 1n)).to.be.revertedWithCustomError(
       token,
       'NotAuthorized'
     );
+    await expect(token.connect(alice).burn(alice.address, 0n)).to.be.revertedWithCustomError(
+      token,
+      'ZeroAmount'
+    );
     await expect(
       token.connect(alice).burn(alice.address, ethers.parseUnits('11', 18))
     ).to.be.revertedWithCustomError(token, 'InsufficientBalance');
   });
 
-  it('pauses and unpauses transfers and mints', async function () {
+  it('pauses and unpauses transfers, mints and burns', async function () {
     const { token, owner, issuer, alice, bob } = await deploy();
     await token.connect(issuer).mint(alice.address, ethers.parseUnits('10', 18));
 
     await expect(token.connect(owner).pause()).to.emit(token, 'PauseUpdated').withArgs(true);
+    await assert.equal(await token.isPaused(), true);
     await expect(
       token.connect(alice).transfer(bob.address, 1n)
     ).to.be.revertedWithCustomError(token, 'TokenIsPaused');
     await expect(
       token.connect(issuer).mint(alice.address, 1n)
     ).to.be.revertedWithCustomError(token, 'TokenIsPaused');
+    await expect(
+      token.connect(alice).burn(alice.address, 1n)
+    ).to.be.revertedWithCustomError(token, 'TokenIsPaused');
 
     await token.connect(owner).unpause();
+    assert.equal(await token.isPaused(), false);
+    await expect(token.connect(owner).unpause()).to.emit(token, 'PauseUpdated').withArgs(false);
     await token.connect(alice).transfer(bob.address, 1n);
     assert.equal(await token.balanceOf(bob.address), 1n);
+  });
+
+  it('pause is owner-restricted', async function () {
+    const { token, alice, issuer } = await deploy();
+    await expect(token.connect(alice).pause()).to.be.revertedWithCustomError(token, 'NotOwner');
+    await expect(token.connect(issuer).unpause()).to.be.revertedWithCustomError(token, 'NotOwner');
   });
 
   it('rotates issuer and owner', async function () {
@@ -158,5 +216,21 @@ describe('PotERC20', function () {
     await token.connect(owner).transferOwnership(bob.address);
     assert.equal(await token.owner(), bob.address);
     await expect(token.connect(owner).pause()).to.be.revertedWithCustomError(token, 'NotOwner');
+  });
+
+  it('setIssuer rejects zero address', async function () {
+    const { token, owner } = await deploy();
+    await expect(token.connect(owner).setIssuer(ZERO)).to.be.revertedWithCustomError(
+      token,
+      'ZeroAddress'
+    );
+  });
+
+  it('transferOwnership rejects zero address', async function () {
+    const { token, owner } = await deploy();
+    await expect(token.connect(owner).transferOwnership(ZERO)).to.be.revertedWithCustomError(
+      token,
+      'ZeroAddress'
+    );
   });
 });

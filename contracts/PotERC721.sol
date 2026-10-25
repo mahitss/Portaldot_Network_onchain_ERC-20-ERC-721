@@ -13,6 +13,7 @@ contract PotERC721 {
     address public issuer;
 
     uint256 private _nextTokenId = 1;
+    uint256 private _totalSupply;
     mapping(uint256 => address) private _owners;
     mapping(address => uint256) private _balances;
     mapping(uint256 => address) private _tokenApprovals;
@@ -34,6 +35,10 @@ contract PotERC721 {
     error TokenAlreadyExists();
     error WrongFromAddress();
     error NotReceiver();
+    error NotERC165();
+
+    bytes4 private constant ERC165_INTERFACE_ID = 0x01ffc9a7;
+    bytes4 private constant ERC721_INTERFACE_ID = 0x80ac58cd;
 
     constructor(string memory collectionName, string memory collectionSymbol, address collectionIssuer) {
         owner = msg.sender;
@@ -60,6 +65,7 @@ contract PotERC721 {
         _nextTokenId += 1;
         _owners[tokenId] = to;
         _balances[to] += 1;
+        _totalSupply += 1;
         _tokenURIs[tokenId] = uri;
         emit Transfer(address(0), to, tokenId);
         emit MetadataUpdated(tokenId, uri);
@@ -73,6 +79,7 @@ contract PotERC721 {
         delete _tokenURIs[tokenId];
         unchecked {
             _balances[tokenOwner] -= 1;
+            _totalSupply -= 1;
         }
         _owners[tokenId] = address(0);
         emit Transfer(tokenOwner, address(0), tokenId);
@@ -118,9 +125,27 @@ contract PotERC721 {
     }
 
     function safeTransferFrom(address from, address to, uint256 tokenId) external {
+        _safeTransferFrom(from, to, tokenId, new bytes(0));
+    }
+
+    function safeTransferFrom(
+        address from,
+        address to,
+        uint256 tokenId,
+        bytes calldata data
+    ) external {
+        _safeTransferFrom(from, to, tokenId, data);
+    }
+
+    function _safeTransferFrom(
+        address from,
+        address to,
+        uint256 tokenId,
+        bytes memory data
+    ) internal {
         _transfer(from, to, tokenId);
         if (to.code.length > 0) {
-            try IERC721Receiver(to).onERC721Received(msg.sender, from, tokenId, '') returns (bytes4 retval) {
+            try IERC721Receiver(to).onERC721Received(msg.sender, from, tokenId, data) returns (bytes4 retval) {
                 if (retval != IERC721Receiver.onERC721Received.selector) revert NotReceiver();
             } catch {
                 revert NotReceiver();
@@ -154,7 +179,11 @@ contract PotERC721 {
     }
 
     function totalSupply() external view returns (uint256) {
-        return _nextTokenId - 1;
+        return _totalSupply;
+    }
+
+    function supportsInterface(bytes4 interfaceId) external pure returns (bool) {
+        return interfaceId == ERC165_INTERFACE_ID || interfaceId == ERC721_INTERFACE_ID;
     }
 
     function exists(uint256 tokenId) external view returns (bool) {
