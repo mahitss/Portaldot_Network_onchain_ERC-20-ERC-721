@@ -1,0 +1,15 @@
+node_modules/
+artifacts/
+cache/
+coverage/
+typechain-types/
+.env
+.env.*
+!.env.example
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+deployments/local/
+.vscode/
+.idea/

@@ -1,0 +1,29 @@
+{
+  "name": "portaldot-onchain-erc20-erc721",
+  "version": "0.1.0",
+  "private": true,
+  "description": "On-chain ERC-20 and ERC-721 token suite for Portaldot V3 (pallet-revive) with a native-ledger binding registry, unit-safe conversion and dual-ledger verification.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "test:sdk": "node --test sdk/test/",
+    "preflight": "node scripts/preflight.js",
+    "deploy:testnet": "hardhat run scripts/deploy.js --network portaldotTestnet",
+    "verify:deployment": "node scripts/verify-deployment.js",
+    "dual:read": "node scripts/dual-read.js",
+    "check": "npm run compile && npm run test && npm run test:sdk"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-ethers": "^3.0.8",
+    "@nomicfoundation/hardhat-network-helpers": "^1.0.12",
+    "ethers": "^6.13.4",
+    "hardhat": "^2.22.17"
+  },
+  "dependencies": {
+    "@polkadot/api": "^16.5.6"
+  }
+}
