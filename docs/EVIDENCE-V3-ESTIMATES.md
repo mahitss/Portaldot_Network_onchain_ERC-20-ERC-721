@@ -20,28 +20,28 @@ used.
 
 | Contract | Creation bytes | Runtime bytes | Gas | Cost at 31,000 wei |
 | --- | --- | --- | --- | --- |
-| `PotERC20` | 4,457 | 3,284 | 9,339,960,034,898,460 | 289.54 tPOT |
-| `PotERC721` | 6,590 | 5,412 | 14,910,787,702,695,726 | 462.23 tPOT |
-| `PotRegistry` | 4,885 | 4,794 | 12,822,515,128,919,981 | 397.50 tPOT |
-| **Total** | **15,932** | **13,490** | **37,073,262,866,514,167** | **1,149.27 tPOT** |
+| `PotERC20` | 4,431 | 3,258 | 9,650,098,430,981,588 | 287.48 tPOT |
+| `PotERC721` | 6,569 | 5,391 | 15,460,513,308,742,377 | 457.07 tPOT |
+| `PotRegistry` | 5,636 | 5,545 | 15,342,985,002,896,258 | 460.56 tPOT |
+| **Total** | **16,636** | **14,194** | **40,453,596,742,626,191** | **1,205.11 tPOT** |
 
-Per-contract runtime is well under the 10,240 byte Revive limit (largest: 5,412 bytes).
+Per-contract runtime is well under the 10,240 byte Revive limit (largest: 5,545 bytes).
 
 Cost per creation byte is roughly 0.07 to 0.09 tPOT, consistent with the preflight figure of
 529.84 tPOT for the 7,154 creation byte Makhzan contract. At the higher base fees observed
 earlier on the chain (32,580 wei), the same deployment costs ≈ 1,198 tPOT; request at least
-**1,300 tPOT** for the deployer account to keep a margin.
+**1,350 tPOT** for the deployer account to keep a margin.
 
 ## 3. Funding requirement
 
-Request at least **1,050 tPOT** for the native account that maps to the deployer EVM address, so the
-suite deploys with a 10 percent buffer at the current base fee. The base fee is not fixed: it was
-32,580 wei earlier in the chain history and 31,270 wei at the time of measurement, so a larger
-buffer is wise if the price moves.
+Request at least **1,350 tPOT** for the native account that maps to the deployer EVM address, so the
+suite deploys with a margin at the current base fee. The base fee is not fixed: it was 32,580 wei
+earlier in the chain history and 29,790 wei at the time of the last measurement, so a larger buffer
+is wise if the price moves.
 
 The grant has to reach the **native** account that corresponds to the EVM key. For an EVM address
 the native account is the 20-byte H160 followed by twelve `0xEE` bytes, encoded as SS58 with prefix
-42, and the deployer needs at least 1,050 tPOT there before the EVM side sees the balance.
+42, and the deployer needs at least 1,350 tPOT there before the EVM side sees the balance.
 
 ## 4. Accounts observed on the testnet
 

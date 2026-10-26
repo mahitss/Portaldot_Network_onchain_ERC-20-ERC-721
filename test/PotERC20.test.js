@@ -86,20 +86,63 @@ describe('PotERC20', function () {
     assert.equal(await token.totalSupply(), amount);
   });
 
-  it('rejects transfers above balance, zero amount and zero recipient', async function () {
+  it('rejects transfers above balance', async function () {
     const { token, alice, bob } = await deploy();
     await expect(token.connect(alice).transfer(bob.address, 1n)).to.be.revertedWithCustomError(
       token,
       'InsufficientBalance'
     );
-    await expect(token.connect(alice).transfer(bob.address, 0n)).to.be.revertedWithCustomError(
-      token,
-      'ZeroAmount'
-    );
+  });
+
+  it('zero-value transfer to a valid recipient succeeds with no balance change', async function () {
+    const { token, issuer, alice, bob } = await deploy();
+    await token.connect(issuer).mint(alice.address, ethers.parseUnits('10', 18));
+    const before = await token.balanceOf(alice.address);
+    await expect(token.connect(alice).transfer(bob.address, 0n))
+      .to.emit(token, 'Transfer')
+      .withArgs(alice.address, bob.address, 0n);
+    assert.equal(await token.balanceOf(alice.address), before);
+    assert.equal(await token.balanceOf(bob.address), 0n);
+    assert.equal(await token.totalSupply(), ethers.parseUnits('10', 18));
+  });
+
+  it('transfer to the zero address reverts', async function () {
+    const { token, issuer, alice } = await deploy();
+    await token.connect(issuer).mint(alice.address, ethers.parseUnits('10', 18));
     await expect(token.connect(alice).transfer(ZERO, 1n)).to.be.revertedWithCustomError(
       token,
       'ZeroAddress'
     );
+  });
+
+  it('zero-value transferFrom succeeds with allowance and does not decrement it', async function () {
+    const { token, issuer, alice, bob, spender } = await deploy();
+    await token.connect(issuer).mint(alice.address, ethers.parseUnits('10', 18));
+    await token.connect(alice).approve(spender.address, ethers.parseUnits('5', 18));
+    const before = await token.allowance(alice.address, spender.address);
+    await expect(token.connect(spender).transferFrom(alice.address, bob.address, 0n))
+      .to.emit(token, 'Transfer')
+      .withArgs(alice.address, bob.address, 0n);
+    assert.equal(await token.allowance(alice.address, spender.address), before);
+    assert.equal(await token.balanceOf(bob.address), 0n);
+  });
+
+  it('zero-value transferFrom succeeds even without allowance', async function () {
+    const { token, issuer, alice, bob, spender } = await deploy();
+    await token.connect(issuer).mint(alice.address, ethers.parseUnits('10', 18));
+    await expect(token.connect(spender).transferFrom(alice.address, bob.address, 0n))
+      .to.emit(token, 'Transfer')
+      .withArgs(alice.address, bob.address, 0n);
+    assert.equal(await token.balanceOf(bob.address), 0n);
+  });
+
+  it('zero-value transferFrom to the zero address reverts', async function () {
+    const { token, issuer, alice, spender } = await deploy();
+    await token.connect(issuer).mint(alice.address, ethers.parseUnits('10', 18));
+    await token.connect(alice).approve(spender.address, ethers.parseUnits('5', 18));
+    await expect(
+      token.connect(spender).transferFrom(alice.address, ZERO, 0n)
+    ).to.be.revertedWithCustomError(token, 'ZeroAddress');
   });
 
   it('spends allowances and blocks overspending', async function () {

@@ -156,16 +156,65 @@ describe('PotERC721', function () {
     assert.equal(await collection.totalSupply(), 0n);
   });
 
-  it('burn custodial by issuer and owner', async function () {
+  it('burn by token owner only; owner and issuer cannot burn another user token', async function () {
     const { collection, owner, issuer, alice } = await deploy();
     await collection.connect(issuer).mint(alice.address, 'ipfs://token/1');
 
-    await collection.connect(issuer).burn(1n);
+    await collection.connect(alice).burn(1n);
     assert.equal(await collection.exists(1n), false);
     assert.equal(await collection.totalSupply(), 0n);
 
     await collection.connect(issuer).mint(alice.address, 'ipfs://token/2');
-    await collection.connect(owner).burn(2n);
+    await expect(collection.connect(owner).burn(2n)).to.be.revertedWithCustomError(
+      collection,
+      'NotAuthorized'
+    );
+    await expect(collection.connect(issuer).burn(2n)).to.be.revertedWithCustomError(
+      collection,
+      'NotAuthorized'
+    );
+    assert.equal(await collection.exists(2n), true);
+  });
+
+  it('unrelated owner or issuer cannot transfer another user token without approval', async function () {
+    const { collection, owner, issuer, alice, bob } = await deploy();
+    await collection.connect(issuer).mint(alice.address, 'ipfs://token/1');
+
+    await expect(
+      collection.connect(owner).transferFrom(alice.address, bob.address, 1n)
+    ).to.be.revertedWithCustomError(collection, 'NotAuthorized');
+    await expect(
+      collection.connect(issuer).transferFrom(alice.address, bob.address, 1n)
+    ).to.be.revertedWithCustomError(collection, 'NotAuthorized');
+    assert.equal(await collection.ownerOf(1n), alice.address);
+  });
+
+  it('unrelated owner or issuer cannot burn another user token', async function () {
+    const { collection, owner, issuer, alice } = await deploy();
+    await collection.connect(issuer).mint(alice.address, 'ipfs://token/1');
+
+    await expect(collection.connect(owner).burn(1n)).to.be.revertedWithCustomError(
+      collection,
+      'NotAuthorized'
+    );
+    await expect(collection.connect(issuer).burn(1n)).to.be.revertedWithCustomError(
+      collection,
+      'NotAuthorized'
+    );
+    assert.equal(await collection.exists(1n), true);
+  });
+
+  it('properly approved operator can transfer and burn', async function () {
+    const { collection, issuer, alice, operator } = await deploy();
+    await collection.connect(issuer).mint(alice.address, 'ipfs://token/1');
+    await collection.connect(alice).approve(operator.address, 1n);
+
+    await collection.connect(operator).transferFrom(alice.address, operator.address, 1n);
+    assert.equal(await collection.ownerOf(1n), operator.address);
+
+    await collection.connect(issuer).mint(alice.address, 'ipfs://token/2');
+    await collection.connect(alice).approve(operator.address, 2n);
+    await collection.connect(operator).burn(2n);
     assert.equal(await collection.exists(2n), false);
   });
 
@@ -258,7 +307,7 @@ describe('PotERC721', function () {
     await collection.connect(issuer).mint(alice.address, 'ipfs://token/1');
     const data = ethers.encodeBytes32String('memo');
     await expect(
-      collection['safeTransferFrom(address,address,uint256,bytes)'](
+      collection.connect(alice)['safeTransferFrom(address,address,uint256,bytes)'](
         alice.address,
         receiverAddress,
         1n,

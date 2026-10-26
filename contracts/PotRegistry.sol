@@ -1,5 +1,13 @@
 pragma solidity 0.8.24;
 
+interface IERC165 {
+    function supportsInterface(bytes4 interfaceId) external view returns (bool);
+}
+
+interface IERC20Decimals {
+    function decimals() external view returns (uint8);
+}
+
 contract PotRegistry {
     uint8 public constant KIND_ERC20 = 0;
     uint8 public constant KIND_ERC721 = 1;
@@ -56,6 +64,8 @@ contract PotRegistry {
     error InvalidCommitment();
     error NativeIdAlreadyBound();
     error PrecisionLoss();
+    error NotAContract();
+    error NoNativeCounterpart();
 
     constructor() {
         owner = msg.sender;
@@ -86,6 +96,15 @@ contract PotRegistry {
         if (bindingIdOf[token] != 0) revert TokenAlreadyBound();
         if (nativeKind != NATIVE_NONE && bindingIdOfNative[nativeKind][nativeId] != 0) revert NativeIdAlreadyBound();
         if (nativeAccountHash == bytes32(0)) revert InvalidCommitment();
+
+        if (tokenKind == KIND_ERC20) {
+            if (nativeKind != NATIVE_NONE && nativeKind != NATIVE_ASSETS) revert InvalidNativeKind();
+            _verifyERC20(token, evmDecimals);
+        } else {
+            if (nativeKind != NATIVE_NONE && nativeKind != NATIVE_NFTS) revert InvalidNativeKind();
+            if (nativeDecimals != 0 || evmDecimals != 0) revert InvalidDecimals();
+            _verifyERC721(token);
+        }
 
         uint128 factor = uint128(10 ** uint256(evmDecimals - nativeDecimals));
         bindingId = bindingCount + 1;
@@ -161,6 +180,7 @@ contract PotRegistry {
     function convertToNative(uint256 bindingId, uint256 evmAmount) external view returns (uint256) {
         Binding memory binding = _bindings[bindingId];
         if (binding.token == address(0)) revert UnknownBinding();
+        if (binding.nativeKind == NATIVE_NONE) revert NoNativeCounterpart();
         if (evmAmount % binding.conversionFactor != 0) revert PrecisionLoss();
         return evmAmount / binding.conversionFactor;
     }
@@ -168,6 +188,7 @@ contract PotRegistry {
     function convertToEvm(uint256 bindingId, uint256 nativeAmount) external view returns (uint256) {
         Binding memory binding = _bindings[bindingId];
         if (binding.token == address(0)) revert UnknownBinding();
+        if (binding.nativeKind == NATIVE_NONE) revert NoNativeCounterpart();
         return nativeAmount * binding.conversionFactor;
     }
 
@@ -175,5 +196,27 @@ contract PotRegistry {
         Binding memory binding = _bindings[bindingId];
         if (binding.token == address(0)) revert UnknownBinding();
         return binding.active && binding.nativeAccountHash == accountHash;
+    }
+
+    function _verifyERC20(address token, uint8 evmDecimals) private view {
+        if (token.code.length == 0) revert NotAContract();
+        uint8 tokenDecimals;
+        try IERC20Decimals(token).decimals() returns (uint8 d) {
+            tokenDecimals = d;
+        } catch {
+            revert InvalidDecimals();
+        }
+        if (tokenDecimals != evmDecimals) revert InvalidDecimals();
+    }
+
+    function _verifyERC721(address token) private view {
+        if (token.code.length == 0) revert NotAContract();
+        bool supported;
+        try IERC165(token).supportsInterface(ERC721_INTERFACE_ID) returns (bool b) {
+            supported = b;
+        } catch {
+            revert InvalidTokenKind();
+        }
+        if (!supported) revert InvalidTokenKind();
     }
 }

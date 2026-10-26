@@ -115,8 +115,8 @@ contract PotERC20 {
 
     function transferFrom(address from, address to, uint256 amount) external whenNotPaused returns (bool) {
         uint256 allowed = allowance[from][msg.sender];
-        if (allowed != type(uint256).max) {
-            if (allowed < amount) revert InsufficientAllowance();
+        if (allowed < amount) revert InsufficientAllowance();
+        if (allowed != type(uint256).max && amount != 0) {
             unchecked {
                 allowance[from][msg.sender] = allowed - amount;
             }
@@ -128,13 +128,14 @@ contract PotERC20 {
 
     function _transfer(address from, address to, uint256 amount) internal {
         if (to == address(0)) revert ZeroAddress();
-        if (amount == 0) revert ZeroAmount();
-        uint256 balance = balanceOf[from];
-        if (balance < amount) revert InsufficientBalance();
-        unchecked {
-            balanceOf[from] = balance - amount;
+        if (amount != 0) {
+            uint256 balance = balanceOf[from];
+            if (balance < amount) revert InsufficientBalance();
+            unchecked {
+                balanceOf[from] = balance - amount;
+            }
+            balanceOf[to] += amount;
         }
-        balanceOf[to] += amount;
         emit Transfer(from, to, amount);
     }
 }

@@ -39,6 +39,7 @@ contract PotERC721 {
 
     bytes4 private constant ERC165_INTERFACE_ID = 0x01ffc9a7;
     bytes4 private constant ERC721_INTERFACE_ID = 0x80ac58cd;
+    bytes4 private constant ERC721_METADATA_INTERFACE_ID = 0x5b5e139f;
 
     constructor(string memory collectionName, string memory collectionSymbol, address collectionIssuer) {
         owner = msg.sender;
@@ -183,7 +184,9 @@ contract PotERC721 {
     }
 
     function supportsInterface(bytes4 interfaceId) external pure returns (bool) {
-        return interfaceId == ERC165_INTERFACE_ID || interfaceId == ERC721_INTERFACE_ID;
+        return interfaceId == ERC165_INTERFACE_ID
+            || interfaceId == ERC721_INTERFACE_ID
+            || interfaceId == ERC721_METADATA_INTERFACE_ID;
     }
 
     function exists(uint256 tokenId) external view returns (bool) {
@@ -199,8 +202,6 @@ contract PotERC721 {
     function _isApprovedOrOwner(address spender, uint256 tokenId) internal view returns (bool) {
         address tokenOwner = _owners[tokenId];
         return spender == tokenOwner
-            || spender == issuer
-            || spender == owner
             || spender == _tokenApprovals[tokenId]
             || _operatorApprovals[tokenOwner][spender];
     }
