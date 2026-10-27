@@ -109,7 +109,7 @@ contract PotERC721 {
     function approve(address to, uint256 tokenId) external {
         address tokenOwner = _owners[tokenId];
         if (tokenOwner == address(0)) revert TokenDoesNotExist();
-        if (msg.sender != tokenOwner && !_isApprovedOrOwner(msg.sender, tokenId)) revert NotAuthorized();
+        if (msg.sender != tokenOwner && !_operatorApprovals[tokenOwner][msg.sender]) revert NotAuthorized();
         _tokenApprovals[tokenId] = to;
         emit Approval(tokenOwner, to, tokenId);
     }

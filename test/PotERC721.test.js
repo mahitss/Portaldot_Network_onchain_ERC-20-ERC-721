@@ -22,11 +22,13 @@ describe('PotERC721', function () {
     assert.equal(await collection.totalSupply(), 0n);
   });
 
-  it('implements ERC-165 supportsInterface for ERC-165 and ERC-721', async function () {
+  it('implements ERC-165 supportsInterface for ERC-165, ERC-721 and ERC-721 Metadata', async function () {
     const { collection } = await deploy();
     assert.equal(await collection.supportsInterface('0x01ffc9a7'), true);
     assert.equal(await collection.supportsInterface('0x80ac58cd'), true);
-    assert.equal(await collection.supportsInterface('0x00000000'), false);
+    assert.equal(await collection.supportsInterface('0x5b5e139f'), true);
+    assert.equal(await collection.supportsInterface('0xffffffff'), false);
+    assert.equal(await collection.supportsInterface('0x12345678'), false);
   });
 
   it('mints sequential ids with metadata and events', async function () {
@@ -140,6 +142,37 @@ describe('PotERC721', function () {
 
     await collection.connect(operator).transferFrom(alice.address, operator.address, 1n);
     assert.equal(await collection.getApproved(1n), ZERO);
+    assert.equal(await collection.ownerOf(1n), operator.address);
+  });
+
+  it('an approved-for-one-token address cannot replace that token approval', async function () {
+    const { collection, issuer, alice, bob } = await deploy();
+    await collection.connect(issuer).mint(alice.address, 'ipfs://token/1');
+    await collection.connect(alice).approve(bob.address, 1n);
+    assert.equal(await collection.getApproved(1n), bob.address);
+    await expect(
+      collection.connect(bob).approve(alice.address, 1n)
+    ).to.be.revertedWithCustomError(collection, 'NotAuthorized');
+    assert.equal(await collection.getApproved(1n), bob.address);
+  });
+
+  it('the token owner can grant and revoke token approval', async function () {
+    const { collection, issuer, alice, bob } = await deploy();
+    await collection.connect(issuer).mint(alice.address, 'ipfs://token/1');
+    await collection.connect(alice).approve(bob.address, 1n);
+    assert.equal(await collection.getApproved(1n), bob.address);
+    await collection.connect(alice).approve(ZERO, 1n);
+    assert.equal(await collection.getApproved(1n), ZERO);
+  });
+
+  it('an operator-for-all can replace token approval and can transfer', async function () {
+    const { collection, issuer, alice, bob, operator } = await deploy();
+    await collection.connect(issuer).mint(alice.address, 'ipfs://token/1');
+    await collection.connect(alice).setApprovalForAll(operator.address, true);
+    assert.equal(await collection.isApprovedForAll(alice.address, operator.address), true);
+    await collection.connect(operator).approve(bob.address, 1n);
+    assert.equal(await collection.getApproved(1n), bob.address);
+    await collection.connect(operator).transferFrom(alice.address, operator.address, 1n);
     assert.equal(await collection.ownerOf(1n), operator.address);
   });
 

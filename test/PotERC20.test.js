@@ -145,6 +145,15 @@ describe('PotERC20', function () {
     ).to.be.revertedWithCustomError(token, 'ZeroAddress');
   });
 
+  it('zero-value transferFrom from the zero address reverts', async function () {
+    const { token, issuer, alice, bob, spender } = await deploy();
+    await token.connect(issuer).mint(alice.address, ethers.parseUnits('10', 18));
+    await token.connect(alice).approve(spender.address, ethers.parseUnits('5', 18));
+    await expect(
+      token.connect(spender).transferFrom(ZERO, bob.address, 0n)
+    ).to.be.revertedWithCustomError(token, 'ZeroAddress');
+  });
+
   it('spends allowances and blocks overspending', async function () {
     const { token, issuer, alice, bob, spender } = await deploy();
     const minted = ethers.parseUnits('100', 18);

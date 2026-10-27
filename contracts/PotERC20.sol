@@ -114,6 +114,7 @@ contract PotERC20 {
     }
 
     function transferFrom(address from, address to, uint256 amount) external whenNotPaused returns (bool) {
+        if (from == address(0)) revert ZeroAddress();
         uint256 allowed = allowance[from][msg.sender];
         if (allowed < amount) revert InsufficientAllowance();
         if (allowed != type(uint256).max && amount != 0) {
