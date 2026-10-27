@@ -12,6 +12,28 @@ export const SS58_PREFIX = 42;
 export const ACCOUNT_SUFFIX_BYTE = 0xee;
 export const SS58PRE = new TextEncoder().encode('SS58PRE');
 
+export const MAX_UINT256 = (1n << 256n) - 1n;
+
+function toBigIntAmount(amount) {
+  if (typeof amount === 'bigint') {
+    if (amount < 0n) {
+      throw new Error('amount must be non-negative');
+    }
+    return amount;
+  }
+  if (typeof amount === 'number') {
+    throw new Error(`amount must be a bigint or decimal-integer string, got number`);
+  }
+  if (typeof amount === 'string') {
+    const trimmed = amount.trim();
+    if (!/^\d+$/.test(trimmed)) {
+      throw new Error(`invalid amount: ${amount}`);
+    }
+    return BigInt(trimmed);
+  }
+  throw new Error(`amount must be a bigint or decimal-integer string, got ${typeof amount}`);
+}
+
 export const KIND_ERC20 = 0;
 export const KIND_ERC721 = 1;
 export const NATIVE_NONE = 0;
@@ -128,8 +150,18 @@ export function evmAddressToNativeAccount(evmAddress, prefix = SS58_PREFIX) {
 
 export function nativeAccountToEvmAddress(ss58) {
   const decoded = ss58Decode(ss58);
+  if (decoded.prefix !== SS58_PREFIX) {
+    throw new Error(`invalid SS58 prefix: ${decoded.prefix}, expected ${SS58_PREFIX}`);
+  }
   if (decoded.bytes.length !== 32) {
     throw new Error(`expected a 32 byte account, got ${decoded.bytes.length}`);
+  }
+  for (let i = 20; i < 32; i += 1) {
+    if (decoded.bytes[i] !== ACCOUNT_SUFFIX_BYTE) {
+      throw new Error(
+        `invalid native account suffix byte at position ${i}: expected 0x${ACCOUNT_SUFFIX_BYTE.toString(16).padStart(2, '0')}, got 0x${decoded.bytes[i].toString(16).padStart(2, '0')}`
+      );
+    }
   }
   return toHex(decoded.bytes.subarray(0, 20));
 }
@@ -145,11 +177,20 @@ export async function nativeAccountHash(evmAddress) {
 }
 
 export function evmToNative(amount) {
-  return BigInt(amount) / CONVERSION_FACTOR;
+  const value = toBigIntAmount(amount);
+  if (value % CONVERSION_FACTOR !== 0n) {
+    throw new Error(`amount ${value} is not exactly divisible by conversion factor ${CONVERSION_FACTOR}`);
+  }
+  return value / CONVERSION_FACTOR;
 }
 
 export function nativeToEvm(amount) {
-  return BigInt(amount) * CONVERSION_FACTOR;
+  const value = toBigIntAmount(amount);
+  const result = value * CONVERSION_FACTOR;
+  if (result > MAX_UINT256) {
+    throw new Error(`conversion result ${result} exceeds uint256 maximum ${MAX_UINT256}`);
+  }
+  return result;
 }
 
 export function formatAmount(amount, decimals) {
