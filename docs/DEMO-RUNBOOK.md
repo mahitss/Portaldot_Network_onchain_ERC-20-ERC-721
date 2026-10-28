@@ -11,8 +11,8 @@ npm run check
 npm run check:funding
 ```
 
-`npm run check` compiles, regenerates the SDK ABI, and runs both test suites (31 contract tests,
-6 SDK tests). `npm run check:funding` must report `funded: true` before anything else.
+`npm run check` compiles, regenerates the SDK ABI, and runs both test suites (72 contract tests,
+12 SDK tests). `npm run check:funding` must report `funded: true` before anything else.
 
 ## 1. Deploy and bind (one command)
 
@@ -20,13 +20,20 @@ npm run check:funding
 npm run release:testnet
 ```
 
-This deploys `PotERC20`, `PotERC721`, and `PotRegistry`, binds the ERC-20 to native asset 1 and the
+That deploys `PotERC20`, `PotERC721`, and `PotRegistry`, binds the ERC-20 to native asset 1 and the
 ERC-721 to native NFT collection 1, and prints the verification report. The artifact to show is
 `deployments/portaldotTestnet.json`, which holds the contract addresses, transaction hashes, and
 block numbers.
 
-If the release has already run, `npm run verify:deployment` re-checks bytecode, receipts, registry
-state, and bindings without sending anything.
+Before running, you must set the native binding IDs:
+
+```bash
+export POT_NATIVE_ASSET_ID=1
+export POT_NATIVE_NFT_ID=1
+```
+
+These IDs must correspond to live native objects on the Portaldot V3 testnet (see
+`npm run dual:read` to inspect existing assets and collections).
 
 ## 2. Show the dual ledger console
 
@@ -83,7 +90,7 @@ console.log(state, binding.conversionFactor, account.ss58);
   is 10,000 EVM wei. Every conversion in the suite is derived from stored decimals, never hardcoded.
 - The mapping is deterministic and verifiable: H160 followed by twelve `0xEE` bytes, SS58 prefix 42,
   checked against the pairs published in the official Portaldot guide.
-- The economics force the architecture: a deployment on this chain costs roughly 911 tPOT for this
+- The economics force the architecture: a deployment on this chain costs roughly 1,205 tPOT for this
   suite against 0.0153 tPOT for a light call, so the design is one shared deployment with per user
   state in the registry, never per user contracts.
 - Verification is scripted, not asserted: `npm run check`, `npm run verify:deployment`, and

@@ -2,6 +2,30 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const root = path.resolve(__dirname, '..');
+const REQUIRED_TPOT = 1350n;
+const NATIVE_DECIMALS = 14;
+const MAX_CODE_SIZE_BYTES = 10240;
+
+const requiredNativeUnits = REQUIRED_TPOT * 10n ** BigInt(NATIVE_DECIMALS);
+
+export function validateContractArtifact(artifactPath, maxSizeBytes) {
+  const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8'));
+  const runtimeBytes = (artifact.deployedBytecode.length - 2) / 2;
+  if (runtimeBytes > maxSizeBytes) {
+    throw new Error(
+      `runtime bytecode is ${runtimeBytes} bytes, exceeds limit of ${maxSizeBytes} bytes`
+    );
+  }
+  return runtimeBytes;
+}
+
+export function validateChainId(chainId, expectedChainId) {
+  if (Number(chainId) !== expectedChainId) {
+    throw new Error(
+      `wrong chain ID: ${chainId}. Expected ${expectedChainId} (Portaldot V3 testnet).`
+    );
+  }
+}
 
 async function main() {
   const hre = require('hardhat');
@@ -10,13 +34,34 @@ async function main() {
   const gasLimit = Number(process.env.POT_GAS_LIMIT || 5000000);
   const overrides = { gasLimit };
 
+  // --- Pre-flight checks (read-only, before any transaction) ---
+
+  // 1. Validate chain ID
+  const network = await hre.ethers.provider.getNetwork();
+  validateChainId(network.chainId, 420420777);
+
+  // 2. Validate artifacts exist and each contract's runtime bytecode is within the Revive limit
+  const contractsToDeploy = [
+    { name: 'PotERC20', file: 'contracts/PotERC20.sol/PotERC20.json' },
+    { name: 'PotERC721', file: 'contracts/PotERC721.sol/PotERC721.json' },
+    { name: 'PotRegistry', file: 'contracts/PotRegistry.sol/PotRegistry.json' },
+  ];
+
+  for (const target of contractsToDeploy) {
+    validateContractArtifact(path.join(root, 'artifacts', target.file), MAX_CODE_SIZE_BYTES);
+  }
+
+  // 3. Validate deployer balance against required threshold
   const balance = await hre.ethers.provider.getBalance(deployer.address);
+  if (balance < requiredNativeUnits) {
+    throw new Error(
+      `deployer has insufficient native balance: ${balance.toString()} wei (${(balance / 10n ** BigInt(NATIVE_DECIMALS)).toString()} tPOT), need at least ${requiredNativeUnits.toString()} wei (${REQUIRED_TPOT.toString()} tPOT)`
+    );
+  }
+
   process.stdout.write(`network   ${networkName}\n`);
   process.stdout.write(`deployer  ${deployer.address}\n`);
   process.stdout.write(`balance   ${hre.ethers.formatEther(balance)} native units\n`);
-  if (balance === 0n) {
-    throw new Error('deployer has no native balance, fund the native account first');
-  }
 
   const contracts = {};
 

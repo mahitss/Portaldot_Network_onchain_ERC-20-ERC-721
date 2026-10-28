@@ -4,6 +4,30 @@ const { Contract, JsonRpcProvider } = require('ethers');
 
 const root = path.resolve(__dirname, '..');
 const RPC_URL = process.env.PORTALDOT_RPC_URL || 'https://test-evm-rpc-v3.portaldot.dev';
+const EXPECTED_CHAIN_ID = 420420777;
+
+export function validateChainId(chainId, expectedChainId) {
+  if (Number(chainId) !== expectedChainId) {
+    throw new Error(
+      `wrong chain ID: ${chainId}. Expected ${expectedChainId} (Portaldot V3 testnet).`
+    );
+  }
+}
+
+export function validateReceipt(txHash, receipt) {
+  if (!receipt) {
+    throw new Error(`transaction receipt not found for ${txHash}`);
+  }
+  if (receipt.status !== 1) {
+    throw new Error(`transaction ${txHash} failed with status ${receipt.status}`);
+  }
+  if (receipt.transactionHash !== txHash) {
+    throw new Error(
+      `receipt transaction hash mismatch: expected ${txHash}, got ${receipt.transactionHash}`
+    );
+  }
+  return receipt;
+}
 
 function loadDeployments() {
   const explicit = process.env.POT_DEPLOYMENTS;
@@ -21,27 +45,42 @@ async function main() {
   const provider = new JsonRpcProvider(RPC_URL, data.chainId);
   const report = { network: data.network, chainId: data.chainId, contracts: {}, bindings: [], ok: true };
 
+  // 1. Require expected chain ID
   const chainId = Number((await provider.getNetwork()).chainId);
+  validateChainId(chainId, EXPECTED_CHAIN_ID);
   report.chainId = chainId;
-  if (chainId !== Number(data.chainId)) {
-    report.ok = false;
-  }
 
+  // 2. Check each expected contract has deployed bytecode and a confirmed receipt
   for (const [name, entry] of Object.entries(data.contracts || {})) {
     const code = await provider.getCode(entry.address);
     const receipt = await provider.getTransactionReceipt(entry.txHash);
+
+    validateReceipt(entry.txHash, receipt);
+
+    const hasCode = code !== '0x';
+    const txConfirmed = Boolean(receipt);
+
     report.contracts[name] = {
       address: entry.address,
-      hasCode: code !== '0x',
+      hasCode,
       codeBytes: Math.max(0, code.length / 2 - 1),
-      txConfirmed: Boolean(receipt),
+      txConfirmed,
+      txSuccessful: receipt ? receipt.status === 1 : false,
+      txMatches: receipt ? receipt.transactionHash === entry.txHash : false,
       blockNumber: receipt ? receipt.blockNumber : null,
     };
-    if (!report.contracts[name].hasCode || !receipt) {
+
+    if (
+      !report.contracts[name].hasCode ||
+      !report.contracts[name].txConfirmed ||
+      !report.contracts[name].txSuccessful ||
+      !report.contracts[name].txMatches
+    ) {
       report.ok = false;
     }
   }
 
+  // 3. Validate registry bindings against expected configuration
   const registryAddress = data.contracts?.PotRegistry?.address;
   if (registryAddress) {
     const artifactPath = path.join(root, 'artifacts', 'contracts', 'PotRegistry.sol', 'PotRegistry.json');
@@ -52,6 +91,7 @@ async function main() {
         owner: await registry.owner(),
         bindingCount: Number(await registry.bindingCount()),
       };
+
       for (const token of Object.values(data.tokens || {})) {
         const bound = await registry.isBound(token.address);
         report.bindings.push({ token: token.address, bound });
@@ -65,6 +105,7 @@ async function main() {
             evmDecimals: Number(binding.evmDecimals),
             conversionFactor: String(binding.conversionFactor),
             nativeAccountHash: binding.nativeAccountHash,
+            active: binding.active,
           };
         }
       }

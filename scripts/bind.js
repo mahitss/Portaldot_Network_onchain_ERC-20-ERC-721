@@ -1,6 +1,19 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
+const root = path.resolve(__dirname, '..');
+const NATIVE_DECIMALS = 14;
+const EVM_DECIMALS = 18;
+const MAX_UINT32 = (1n << 32n) - 1n;
+
+export function validateNativeId(id, name = 'native ID') {
+  const parsed = Number(id);
+  if (!Number.isInteger(parsed) || parsed < 0 || parsed > Number(MAX_UINT32)) {
+    throw new Error(`invalid ${name}: ${id}. Must be an integer in [0, 4294967295].`);
+  }
+  return parsed;
+}
+
 async function main() {
   const hre = require('hardhat');
   const networkName = hre.network.name;
@@ -27,12 +40,58 @@ async function main() {
     `file://${path.join(path.resolve(__dirname, '..'), 'shared', 'portaldot.mjs').replace(/\\/g, '/')}`
   );
 
-  const assetId = Number(process.env.POT_NATIVE_ASSET_ID || 1);
-  const nftId = Number(process.env.POT_NATIVE_NFT_ID || 1);
+  // --- Parse and validate native IDs (strict, no defaults) ---
+  const assetIdStr = process.env.POT_NATIVE_ASSET_ID;
+  const nftIdStr = process.env.POT_NATIVE_NFT_ID;
+
+  let assetId = null;
+  let nftId = null;
+
+  if (assetIdStr !== undefined && assetIdStr !== '') {
+    assetId = validateNativeId(assetIdStr, 'POT_NATIVE_ASSET_ID');
+  }
+
+  if (nftIdStr !== undefined && nftIdStr !== '') {
+    nftId = validateNativeId(nftIdStr, 'POT_NATIVE_NFT_ID');
+  }
+
+  if (assetId === null && nftId === null) {
+    throw new Error(
+      'set POT_NATIVE_ASSET_ID and/or POT_NATIVE_NFT_ID to bind. Neither was provided.'
+    );
+  }
+
+  // --- Native preflight: verify configured native objects exist ---
+  const { ApiPromise, WsProvider } = await import('@polkadot/api');
+  const WS_URL = process.env.PORTALDOT_WS_URL || 'wss://test-node-v3.portaldot.dev';
+  const wsProvider = new WsProvider(WS_URL, 20000);
+  const api = await ApiPromise.create({ provider: wsProvider });
+
+  try {
+    if (assetId !== null) {
+      const asset = await api.query.assets.asset(assetId);
+      if (asset === null || asset === undefined) {
+        throw new Error(`native asset ${assetId} does not exist on chain`);
+      }
+      process.stdout.write(`native asset ${assetId} exists: ${asset.toString()}\n`);
+    }
+
+    if (nftId !== null) {
+      const collection = await api.query.nfts.collection(nftId);
+      if (collection === null || collection === undefined) {
+        throw new Error(`native NFT collection ${nftId} does not exist on chain`);
+      }
+      process.stdout.write(`native NFT collection ${nftId} exists: ${collection.toString()}\n`);
+    }
+  } finally {
+    await api.disconnect();
+  }
+
+  // --- Native account hash ---
   const nativeAccount = process.env.POT_NATIVE_ACCOUNT || deployments.deployer;
   const hash = process.env.POT_NATIVE_ACCOUNT_HASH || (await nativeAccountHash(nativeAccount));
 
-  if (assetId > 0) {
+  if (assetId !== null) {
     const token = deployments.tokens.erc20.address;
     if (await registry.isBound(token)) {
       process.stdout.write(`erc20 already bound: ${token}\n`);
@@ -43,7 +102,7 @@ async function main() {
     }
   }
 
-  if (nftId > 0) {
+  if (nftId !== null) {
     const token = deployments.tokens.erc721.address;
     if (await registry.isBound(token)) {
       process.stdout.write(`erc721 already bound: ${token}\n`);
@@ -52,10 +111,6 @@ async function main() {
       await tx.wait();
       process.stdout.write(`erc721 bound to native nft collection ${nftId} in ${tx.hash}\n`);
     }
-  }
-
-  if (assetId === 0 && nftId === 0) {
-    process.stdout.write('set POT_NATIVE_ASSET_ID and/or POT_NATIVE_NFT_ID to bind\n');
   }
 
   const bindingCount = Number(await registry.bindingCount());
