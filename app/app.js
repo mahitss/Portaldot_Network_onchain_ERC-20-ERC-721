@@ -5,6 +5,7 @@ import {
   EVM_DECIMALS,
   NATIVE_DECIMALS,
   RPC_URL,
+  escapeHtml,
   evmAddressToNativeAccount,
   evmToNative,
   formatAmount,
@@ -14,14 +15,6 @@ import {
 } from '../shared/portaldot.mjs';
 
 const state = { provider: null, suite: null, deployments: null };
-
-function escapeHtml(value) {
-  return String(value)
-    .replace(/&/g, '&')
-    .replace(/</g, '<')
-    .replace(/>/g, '>')
-    .replace(/"/g, '"');
-}
 
 function render(target, entries) {
   const node = document.getElementById(target);
@@ -163,7 +156,10 @@ document.getElementById('mapping-form').addEventListener('submit', (event) => {
         rows.push(['sha256 commitment', hash]);
         render('mapping-result', rows);
       })
-      .catch(() => undefined);
+      .catch((error) => {
+        rows.push(['sha256 commitment', `error: ${error.message}`]);
+        render('mapping-result', rows);
+      });
   } catch (error) {
     render('mapping-result', [['error', error.message]]);
   }

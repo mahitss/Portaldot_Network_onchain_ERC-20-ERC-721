@@ -4,6 +4,7 @@ import {
   CONVERSION_FACTOR,
   base58Decode,
   base58Encode,
+  escapeHtml,
   evmAddressToNativeAccount,
   evmToNative,
   formatAmount,
@@ -155,4 +156,50 @@ test('unit conversions keep the 14 to 18 decimal relationship', () => {
   assert.equal(parseAmount('1', 14), 100000000000000n);
   assert.throws(() => parseAmount('1.2345', 2));
   assert.throws(() => parseAmount('abc', 18));
+});
+
+test('evmToNative rejects amounts exceeding uint256 range', () => {
+  const MAX_UINT256 = (1n << 256n) - 1n;
+
+  // Largest uint256-range EVM amount divisible by CONVERSION_FACTOR converts exactly
+  const maxDivisible = (MAX_UINT256 / CONVERSION_FACTOR) * CONVERSION_FACTOR;
+  assert.equal(evmToNative(maxDivisible), maxDivisible / CONVERSION_FACTOR);
+
+  // EVM amount greater than MAX_UINT256 is rejected
+  assert.throws(() => evmToNative(MAX_UINT256 + 1n));
+
+  // Non-divisible EVM amounts are rejected
+  assert.throws(() => evmToNative(9999n));
+});
+
+test('nativeToEvm accepts largest representable result and rejects out-of-range', () => {
+  const MAX_UINT256 = (1n << 256n) - 1n;
+  const maxNative = MAX_UINT256 / CONVERSION_FACTOR;
+
+  // Largest representable result accepted
+  assert.equal(nativeToEvm(maxNative), maxNative * CONVERSION_FACTOR);
+
+  // Input exceeding uint256 rejected
+  assert.throws(() => nativeToEvm(MAX_UINT256 + 1n));
+
+  // Result exceeding uint256 rejected
+  assert.throws(() => nativeToEvm(maxNative + 1n));
+
+  // Negative, fractional, malformed rejected
+  assert.throws(() => nativeToEvm(-1n));
+  assert.throws(() => nativeToEvm('1.5'));
+  assert.throws(() => nativeToEvm('abc'));
+});
+
+test('escapeHtml escapes HTML special characters', () => {
+  assert.equal(escapeHtml('plain text'), 'plain text');
+  assert.equal(escapeHtml('<script>alert(1)</script>'), '&lt;script&gt;alert(1)&lt;/script&gt;');
+  assert.equal(escapeHtml('a & b'), 'a &amp; b');
+  assert.equal(escapeHtml('"quoted"'), '&quot;quoted&quot;');
+  assert.equal(escapeHtml("it's"), 'it&#39;s');
+  assert.equal(
+    escapeHtml('<img src=x onerror=alert(1)>'),
+    '&lt;img src=x onerror=alert(1)&gt;'
+  );
+  assert.equal(escapeHtml(''), '');
 });

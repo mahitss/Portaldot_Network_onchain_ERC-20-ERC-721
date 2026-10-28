@@ -178,6 +178,9 @@ export async function nativeAccountHash(evmAddress) {
 
 export function evmToNative(amount) {
   const value = toBigIntAmount(amount);
+  if (value > MAX_UINT256) {
+    throw new Error(`amount ${value} exceeds uint256 maximum ${MAX_UINT256}`);
+  }
   if (value % CONVERSION_FACTOR !== 0n) {
     throw new Error(`amount ${value} is not exactly divisible by conversion factor ${CONVERSION_FACTOR}`);
   }
@@ -186,6 +189,9 @@ export function evmToNative(amount) {
 
 export function nativeToEvm(amount) {
   const value = toBigIntAmount(amount);
+  if (value > MAX_UINT256) {
+    throw new Error(`input ${value} exceeds uint256 maximum ${MAX_UINT256}`);
+  }
   const result = value * CONVERSION_FACTOR;
   if (result > MAX_UINT256) {
     throw new Error(`conversion result ${result} exceeds uint256 maximum ${MAX_UINT256}`);
@@ -199,6 +205,15 @@ export function formatAmount(amount, decimals) {
   const whole = value / base;
   const fraction = (value % base).toString().padStart(decimals, '0').replace(/0+$/, '');
   return fraction.length > 0 ? `${whole}.${fraction}` : `${whole}`;
+}
+
+export function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 export function parseAmount(text, decimals) {
