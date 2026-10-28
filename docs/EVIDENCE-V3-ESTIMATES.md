@@ -12,36 +12,36 @@ to size a funding request before any account is funded.
 
 ## 2. Measured deployment cost of the PotToken suite
 
-Compiler profile: solc 0.8.24, `evmVersion: cancun`, `viaIR: true`, optimizer enabled with
-`runs: 1`. The viaIR profile with a single optimizer run was chosen because the deployment cost on
-this chain is dominated by the code deposit, so runtime bytecode size is the cost driver.
+Compiler profile: solc 0.8.24, `evmVersion: cancun`, optimizer enabled with `runs: 200`, no viaIR
+(the MISSION 002 quality-gate profile, matching ADR 002). Deployment cost on this chain is
+dominated by the code deposit, so runtime bytecode size is the cost driver. Every number below
+comes from `eth_estimateGas` against the live testnet at a 31,000 wei base fee; no funds were
+used.
 
-| Contract | Creation bytes | Runtime bytes | Gas | Cost at 31,270 wei | Cost at 32,580 wei |
-| --- | --- | --- | --- | --- | --- |
-| `PotERC20` | 4,058 | 2,775 | 7,968,528,748,368,133 | 249.18 tPOT | 259.61 tPOT |
-| `PotERC721` | 5,799 | 4,517 | 12,512,097,908,704,717 | 391.25 tPOT | 407.64 tPOT |
-| `PotRegistry` | 3,284 | 3,201 | 8,670,927,359,302,908 | 271.14 tPOT | 282.50 tPOT |
-| **Total** | **13,141** | **10,493** | **29,151,554,007,375,758** | **911.57 tPOT** | **949.76 tPOT** |
+| Contract | Creation bytes | Runtime bytes | Gas | Cost at 31,000 wei |
+| --- | --- | --- | --- | --- |
+| `PotERC20` | 4,431 | 3,258 | 9,650,098,430,981,588 | 287.48 tPOT |
+| `PotERC721` | 6,569 | 5,391 | 15,460,513,308,742,377 | 457.07 tPOT |
+| `PotRegistry` | 5,636 | 5,545 | 15,342,985,002,896,258 | 460.56 tPOT |
+| **Total** | **16,636** | **14,194** | **40,453,596,742,626,191** | **1,205.11 tPOT** |
 
-Runtime total 10,493 bytes sits just under the 10,240 byte per-contract limit for the largest
-contract at 4,517 bytes, well within the limit for every contract.
+Per-contract runtime is well under the 10,240 byte Revive limit (largest: 5,545 bytes).
 
-The non-viaIR profile (`runs: 200`, no viaIR) produced 12,453 runtime bytes and an estimated
-1,111.72 tPOT at 32,580 wei, so the lean profile removes about 162 tPOT and roughly 2 kB of code.
-
-Cost per creation byte is about 0.067 to 0.085 tPOT depending on the contract, which matches the
-preflight figure of 529.84 tPOT for the 7,154 creation byte Makhzan contract.
+Cost per creation byte is roughly 0.07 to 0.09 tPOT, consistent with the preflight figure of
+529.84 tPOT for the 7,154 creation byte Makhzan contract. At the higher base fees observed
+earlier on the chain (32,580 wei), the same deployment costs ≈ 1,198 tPOT; request at least
+**1,350 tPOT** for the deployer account to keep a margin.
 
 ## 3. Funding requirement
 
-Request at least **1,050 tPOT** for the native account that maps to the deployer EVM address, so the
-suite deploys with a 10 percent buffer at the current base fee. The base fee is not fixed: it was
-32,580 wei earlier in the chain history and 31,270 wei at the time of measurement, so a larger
-buffer is wise if the price moves.
+Request at least **1,350 tPOT** for the native account that maps to the deployer EVM address, so the
+suite deploys with a margin at the current base fee. The base fee is not fixed: it was 32,580 wei
+earlier in the chain history and 29,790 wei at the time of the last measurement, so a larger buffer
+is wise if the price moves.
 
 The grant has to reach the **native** account that corresponds to the EVM key. For an EVM address
 the native account is the 20-byte H160 followed by twelve `0xEE` bytes, encoded as SS58 with prefix
-42, and the deployer needs at least 1,050 tPOT there before the EVM side sees the balance.
+42, and the deployer needs at least 1,350 tPOT there before the EVM side sees the balance.
 
 ## 4. Accounts observed on the testnet
 

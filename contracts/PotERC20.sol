@@ -27,6 +27,9 @@ contract PotERC20 {
     error ZeroAmount();
     error InsufficientBalance();
     error InsufficientAllowance();
+    error NotERC165();
+
+    bytes4 private constant ERC165_INTERFACE_ID = 0x01ffc9a7;
 
     constructor(string memory tokenName, string memory tokenSymbol, address tokenIssuer) {
         owner = msg.sender;
@@ -94,6 +97,10 @@ contract PotERC20 {
         owner = newOwner;
     }
 
+    function supportsInterface(bytes4 interfaceId) external pure returns (bool) {
+        return interfaceId == ERC165_INTERFACE_ID;
+    }
+
     function transfer(address to, uint256 amount) external whenNotPaused returns (bool) {
         _transfer(msg.sender, to, amount);
         return true;
@@ -107,9 +114,10 @@ contract PotERC20 {
     }
 
     function transferFrom(address from, address to, uint256 amount) external whenNotPaused returns (bool) {
+        if (from == address(0)) revert ZeroAddress();
         uint256 allowed = allowance[from][msg.sender];
-        if (allowed != type(uint256).max) {
-            if (allowed < amount) revert InsufficientAllowance();
+        if (allowed < amount) revert InsufficientAllowance();
+        if (allowed != type(uint256).max && amount != 0) {
             unchecked {
                 allowance[from][msg.sender] = allowed - amount;
             }
@@ -121,13 +129,14 @@ contract PotERC20 {
 
     function _transfer(address from, address to, uint256 amount) internal {
         if (to == address(0)) revert ZeroAddress();
-        if (amount == 0) revert ZeroAmount();
-        uint256 balance = balanceOf[from];
-        if (balance < amount) revert InsufficientBalance();
-        unchecked {
-            balanceOf[from] = balance - amount;
+        if (amount != 0) {
+            uint256 balance = balanceOf[from];
+            if (balance < amount) revert InsufficientBalance();
+            unchecked {
+                balanceOf[from] = balance - amount;
+            }
+            balanceOf[to] += amount;
         }
-        balanceOf[to] += amount;
         emit Transfer(from, to, amount);
     }
 }

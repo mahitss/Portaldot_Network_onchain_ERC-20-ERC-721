@@ -23,7 +23,7 @@
     "dual:read": "node scripts/dual-read.js",
     "app": "npm run build:app && node scripts/serve-app.js",
     "build:app": "esbuild app/app.js --bundle --format=esm --outfile=app/bundle.js --platform=browser --target=es2022",
-    "check": "npm run compile && npm run abi && npm run test && npm run test:sdk"
+    "check": "npm run compile && npm run abi && npm run test && npm run test:sdk && npm run build:app"
   },
   "devDependencies": {
     "@nomicfoundation/hardhat-chai-matchers": "^2.1.2",

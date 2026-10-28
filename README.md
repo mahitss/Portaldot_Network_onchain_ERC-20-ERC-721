@@ -1,8 +1,8 @@
 # PotToken Suite for Portaldot V3
 
 On-chain ERC-20 and ERC-721 tokens for the Portaldot V3 testnet, plus a registry that binds each
-token to its native `assets` or `nfts` counterpart, stores both decimal bases, and exposes a
-SHA-256 commitment to the native account that owns the EVM identity.
+token to its native `assets` or `nfts` counterpart, stores both decimal bases, and stores a
+SHA-256 commitment to the native account derived from the EVM identity.
 
 The suite is deployed once per network and shared by every user. A Portaldot V3 contract deploy
 costs roughly 529.84 tPOT, so per-user contracts are not viable; one shared deployment with a
@@ -14,7 +14,7 @@ binding registry keeps the cost fixed while still giving every holder a verifiab
 | --- | --- |
 | `PotERC20` | Fungible token with issuer-gated minting, holder/issuer/owner burns, approvals, transfers, and owner pause control. |
 | `PotERC721` | NFT collection with sequential ids, metadata URIs, approvals, operator approvals, safe transfers with receiver checks, and burns. |
-| `PotRegistry` | Binds a token address to a native `assets` id or `nfts` collection id, records both decimal bases, derives the conversion factor, stores the native account commitment, and verifies it on chain. |
+| `PotRegistry` | Binds a token address to a native `assets` id or `nfts` collection id, records both decimal bases, derives the conversion factor, stores a SHA-256 native-account commitment, and checks commitment equality on chain. |
 
 Supporting code:
 
@@ -47,6 +47,14 @@ EVM address 0xf7eC65d11e35375A250e474059a917B537804142
 account     0xf7ec65d11e35375a250e474059a917b537804142eeeeeeeeeeeeeeeeeeeeeeee
 SS58        5Hfmuhj1AHrTBJiC9zUPnJo1cfG2G52LLMwofSigBnjtto8Y
 ```
+
+### Commitment semantics
+
+The registry stores `SHA-256(account bytes)` as a commitment and `verifyNativeAccount`
+checks that a supplied hash equals the stored commitment. This is a commitment-equality
+check only: it proves the registrant recorded a specific hash, not that the caller
+controls the native account or that the native asset is linked to the EVM token. An
+independently verified native-ledger relationship is outside the scope of this contract.
 
 The mapping, the SS58 encoding, and the BLAKE2b-512 implementation are covered by vectors in
 `sdk/test/portaldot.test.mjs`, including the pairs published in the official Portaldot V3 guide.
@@ -107,7 +115,7 @@ npm run bind:testnet
 
 | Command | Purpose |
 | --- | --- |
-| `npm run compile` | Compile the contracts with solc 0.8.24, cancun evm version, viaIR pipeline, optimizer 1 run. |
+| `npm run compile` | Compile the contracts with solc 0.8.24, cancun evm version, optimizer 200 runs. |
 | `npm run abi` | Regenerate `sdk/abi.generated.mjs` from the compiled artifacts. |
 | `npm test` | Run the Hardhat contract test suite. |
 | `npm run test:sdk` | Run the shared primitive tests with the Node test runner. |
@@ -139,28 +147,28 @@ npm run bind:testnet
 
 ## Deployment cost
 
-The deployment cost is dominated by the code deposit, so the suite is compiled with the viaIR
-pipeline and a single optimizer run to keep the runtime bytecode small. Measured on the live
-testnet with `eth_estimateGas` at the 31,270 wei base fee:
+The deployment cost is dominated by the code deposit, so the suite is compiled with solc 0.8.24,
+cancun evm version and optimizer 200 runs (no viaIR). Measured on the live testnet with
+`eth_estimateGas` at the 31,000 wei base fee:
 
 | Contract | Creation bytes | Runtime bytes | Cost |
 | --- | --- | --- | --- |
-| `PotERC20` | 4,058 | 2,775 | ≈ 249.18 tPOT |
-| `PotERC721` | 5,799 | 4,517 | ≈ 391.25 tPOT |
-| `PotRegistry` | 3,284 | 3,201 | ≈ 271.14 tPOT |
-| **Total** | 13,141 | 10,493 | **≈ 911.57 tPOT** |
+| `PotERC20` | 4,431 | 3,258 | ≈ 287.48 tPOT |
+| `PotERC721` | 6,569 | 5,391 | ≈ 457.07 tPOT |
+| `PotRegistry` | 5,636 | 5,545 | ≈ 460.56 tPOT |
+| **Total** | 16,636 | 14,194 | **≈ 1,205.11 tPOT** |
 
-Request at least **1,050 tPOT** for the deployer account. The same estimates at the 32,580 wei
-price seen earlier in the chain history come to ≈ 949.76 tPOT. `npm run estimate:deploy` refreshes
-the numbers against the live base fee.
+Per-contract runtime is under the 10,240 byte Revive limit. Request at least **1,350 tPOT** for
+the deployer account; base fees vary (measured between 29,790 and 32,580 wei), so a margin is
+advisable. `npm run estimate:deploy` refreshes the numbers against the live base fee.
 
 ## Platform facts
 
 - Chain id `420420777`, EVM RPC `https://test-evm-rpc-v3.portaldot.dev`, native WebSocket
   `wss://test-node-v3.portaldot.dev`
 - Runtime `portaldot-v3` with `pallet-revive`, `pallet_contracts`, `pallet-assets`, and `pallet-nfts`
-- Contract code size limit 10240 bytes; the deployed suite is roughly 2.8 kB, 4.5 kB, and 3.2 kB
-- One shared deployment of this suite costs about 911.57 tPOT at the live base fee, a light call
+- Contract code size limit 10240 bytes; the deployed suite is roughly 3.3 kB, 5.4 kB, and 5.5 kB
+- One shared deployment of this suite costs about 1,205 tPOT at the measured base fee, a light call
   about 0.0153 tPOT, and a storage-heavy call about 58.94 tPOT
 
 The full evidence trail is in `docs/PORTALDOT_PREFLIGHT.md`, and the product decision record is in

@@ -137,3 +137,10 @@ footer {
   color: var(--muted);
   font-size: 12px;
 }
+
+.mapping-note {
+  margin-top: 12px;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.5;
+}
