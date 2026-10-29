@@ -1,30 +1,25 @@
+// Funding preflight for the Portaldot V3 deployer account.
+//
+// The funding gate requires SUCCESSFUL reads of BOTH the mapped EVM balance
+// and the corresponding native balance: a connection error or a failed
+// native read is a failed preflight, never a passed one.
+//
+// Units are handled in each ledger's own scale, always as BigInt:
+// - native tPOT balances use 14 decimals,
+// - EVM balances use 18 decimals,
+// - the required funding default is 1,350 tPOT and the threshold is
+//   compared against the balance in the matching ledger's units.
+
 const fs = require('node:fs');
 const path = require('node:path');
 const { Wallet, JsonRpcProvider } = require('ethers');
+const { assessFunding, formatUnits, parseRequiredTpot, NATIVE_DECIMALS, EVM_DECIMALS } = require('./lib/validation.cjs');
+const { readNativeFreeBalance } = require('./lib/native-runtime.cjs');
+const { loadSharedMapping } = require('./lib/shared-loader.cjs');
 
 const root = path.resolve(__dirname, '..');
 const RPC_URL = process.env.PORTALDOT_RPC_URL || 'https://test-evm-rpc-v3.portaldot.dev';
 const WS_URL = process.env.PORTALDOT_WS_URL || 'wss://test-node-v3.portaldot.dev';
-
-// Default required funding: 1,350 tPOT
-export const DEFAULT_REQUIRED_TPOT = 1350n;
-export const NATIVE_DECIMALS = 14;
-export const EVM_DECIMALS = 18;
-
-export function parseRequiredTpot(value) {
-  if (value === undefined || value === '') {
-    return DEFAULT_REQUIRED_TPOT;
-  }
-  const trimmed = String(value).trim();
-  if (!/^\d+$/.test(trimmed)) {
-    throw new Error(`invalid POT_REQUIRED_TPOT: ${value}. Must be a non-negative integer amount of tPOT.`);
-  }
-  return BigInt(trimmed);
-}
-
-export function tpotToUnits(amountTpot, decimals) {
-  return amountTpot * 10n ** BigInt(decimals);
-}
 
 function readKey() {
   if (process.env.PORTALDOT_DEPLOYER_PRIVATE_KEY) {
@@ -36,100 +31,95 @@ function readKey() {
   }
   for (const line of fs.readFileSync(envFile, 'utf8').split('\n')) {
     const entry = line.trim();
-    if (!entry || entry.startsWith('#')) {
-      continue;
-    }
+    if (!entry || entry.startsWith('#')) continue;
     const separator = entry.indexOf('=');
-    if (separator < 0) {
-      continue;
-    }
+    if (separator < 0) continue;
     const key = entry.slice(0, separator).trim();
     const value = entry.slice(separator + 1).trim();
-    if (key === 'PORTALDOT_DEPLOYER_PRIVATE_KEY') {
-      return value;
-    }
+    if (key === 'PORTALDOT_DEPLOYER_PRIVATE_KEY') return value;
   }
   throw new Error('no deployer key found in .env, run npm run init:deployer');
 }
 
-async function readNativeBalance(ss58) {
-  const { ApiPromise, WsProvider } = await import('@polkadot/api');
-  const provider = new WsProvider(WS_URL, 2000);
-  const api = await ApiPromise.create({ provider });
-  try {
-    const account = await api.query.system.account(ss58);
-    return { free: account.data.free.toString(), nonce: account.nonce.toString() };
-  } finally {
-    await api.disconnect();
-  }
-}
-
 async function main() {
   const wallet = new Wallet(readKey());
-  const { evmAddressToNativeAccount } = await import(
-    `file://${path.join(root, 'shared', 'portaldot.mjs').replace(/\\/g, '/')}`
-  );
-  const account = evmAddressToNativeAccount(wallet.address);
+  const shared = await loadSharedMapping(root);
+  const account = shared.evmAddressToNativeAccount(wallet.address);
 
-  const requiredTpott = parseRequiredTpot(process.env.POT_REQUIRED_TPOT);
-  const requiredNativeUnits = tpotToUnits(requiredTpott, NATIVE_DECIMALS);
-  const requiredEvmUnits = tpotToUnits(requiredTpott, EVM_DECIMALS);
+  const requiredTpot = parseRequiredTpot(process.env.POT_REQUIRED_TPOT);
+
+  const evmBalanceWei = await (async () => {
+    try {
+      const provider = new JsonRpcProvider(RPC_URL, 420420777);
+      return { balance: BigInt(await provider.getBalance(wallet.address)) };
+    } catch (error) {
+      return { error: error.shortMessage || error.message };
+    }
+  })();
+
+  const nativeFreeUnits = await (async () => {
+    try {
+      const free = await readNativeFreeBalance({ wsUrl: WS_URL, ss58: account.ss58 });
+      return { free };
+    } catch (error) {
+      return { error: error.shortMessage || error.message };
+    }
+  })();
+
+  const assessment = assessFunding({
+    requiredTpot,
+    evmBalanceWei: evmBalanceWei.balance ?? null,
+    nativeFreeUnits: nativeFreeUnits.free ?? null,
+    evmReadError: evmBalanceWei.error ?? null,
+    nativeReadError: nativeFreeUnits.error ?? null,
+  });
 
   const report = {
     evmAddress: wallet.address,
     nativeSs58: account.ss58,
-    requiredTPOT: requiredTpott.toString(),
-    requiredNativeUnits: requiredNativeUnits.toString(),
-    requiredEvmUnits: requiredEvmUnits.toString(),
-    evm: {},
-    native: {},
+    requiredTPOT: requiredTpot.toString(),
+    requiredNativeUnits: assessment.requiredNativeUnits.toString(),
+    requiredEvmWei: assessment.requiredEvmWei.toString(),
+    evm: {
+      balanceWei: evmBalanceWei.error ? null : evmBalanceWei.balance.toString(),
+      balanceTPOT: evmBalanceWei.error ? null : formatUnits(evmBalanceWei.balance, EVM_DECIMALS),
+      ...(evmBalanceWei.error ? { readError: evmBalanceWei.error } : {}),
+      funded: assessment.evmFunded,
+    },
+    native: {
+      freeUnits: nativeFreeUnits.error ? null : nativeFreeUnits.free.toString(),
+      freeTPOT: nativeFreeUnits.error ? null : formatUnits(nativeFreeUnits.free, NATIVE_DECIMALS),
+      ...(nativeFreeUnits.error ? { readError: nativeFreeUnits.error } : {}),
+      funded: assessment.nativeFunded,
+    },
+    funded: assessment.funded,
   };
-
-  const provider = new JsonRpcProvider(RPC_URL, 420420777);
-
-  // Read EVM balance (18 decimals)
-  const evmBalance = await provider.getBalance(wallet.address);
-  report.evm.balanceWei = evmBalance.toString();
-  report.evm.balanceTPOT = (evmBalance / 10n ** EVM_DECIMALS).toString();
-
-  // Read native balance (14 decimals) - must succeed
-  let nativeReadError = null;
-  let nativeBalance = null;
-  try {
-    const accountInfo = await readNativeBalance(account.ss58);
-    nativeBalance = accountInfo.free;
-    report.native = {
-      free: nativeBalance,
-      nonce: accountInfo.nonce,
-    };
-  } catch (error) {
-    nativeReadError = error.message;
-    report.native = { error: error.message };
-  }
-
-  // Determine funding status: both ledgers must be readable and both must meet threshold
-  const evmFunded = evmBalance >= requiredEvmUnits;
-  const nativeFunded = nativeReadError === null && BigInt(nativeBalance) >= requiredNativeUnits;
-  const funded = evmFunded && nativeFunded;
-
-  report.funded = funded;
-  report.evm.funded = evmFunded;
-  report.native.funded = nativeFunded;
 
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
 
-  if (funded) {
-    process.stdout.write(`\nready to deploy with npm run release:testnet\n`);
-  } else {
-    const missingNative = nativeReadError
-      ? `native read failed: ${nativeReadError}`
-      : `short by ${(requiredNativeUnits - BigInt(nativeBalance || 0n)).toString()} native units`;
-    const missingEvm = evmFunded ? '' : ` EVM short by ${(requiredEvmUnits - evmBalance).toString()} wei`;
-    process.stdout.write(
-      `\nnot funded yet: ${(BigInt(evmBalance) / requiredEvmUnits).toString()} of ${requiredTpott.toString()} tPOT. ${missingNative}${missingEvm}\n`
-    );
-    process.exitCode = 1;
+  if (assessment.funded) {
+    process.stdout.write(`\nfunded: ready to deploy with npm run release:testnet (the release performs its own preflight before any transaction)\n`);
+    return;
   }
+
+  const parts = [];
+  if (evmBalanceWei.error) {
+    parts.push(`EVM balance read failed: ${evmBalanceWei.error}`);
+  } else if (assessment.evmShortfallWei > 0n) {
+    parts.push(
+      `EVM ledger short by ${formatUnits(assessment.evmShortfallWei, EVM_DECIMALS)} tPOT (${assessment.evmShortfallWei} wei)`
+    );
+  }
+  if (nativeFreeUnits.error) {
+    parts.push(`native balance read failed: ${nativeFreeUnits.error}`);
+  } else if (assessment.nativeShortfallUnits > 0n) {
+    parts.push(
+      `native ledger short by ${formatUnits(assessment.nativeShortfallUnits, NATIVE_DECIMALS)} tPOT (${assessment.nativeShortfallUnits} native units)`
+    );
+  }
+  process.stdout.write(`\nnot funded yet: ${parts.join(' | ')}\n`);
+  process.stdout.write(`current balance is ${formatUnits(evmBalanceWei.error ? 0n : evmBalanceWei.balance, EVM_DECIMALS)} tPOT of the required ${requiredTpot.toString()} tPOT (EVM, 18 decimals); the native ledger holds ${nativeFreeUnits.error ? 'unknown' : formatUnits(nativeFreeUnits.free, NATIVE_DECIMALS)} tPOT\n`);
+  process.exitCode = 1;
 }
 
 if (require.main === module) {
@@ -138,3 +128,5 @@ if (require.main === module) {
     process.exitCode = 1;
   });
 }
+
+module.exports = { readKey };

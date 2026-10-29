@@ -5,8 +5,9 @@ token to its native `assets` or `nfts` counterpart, stores both decimal bases, a
 SHA-256 commitment to the native account derived from the EVM identity.
 
 The suite is deployed once per network and shared by every user. A Portaldot V3 contract deploy
-costs roughly 529.84 tPOT, so per-user contracts are not viable; one shared deployment with a
-binding registry keeps the cost fixed while still giving every holder a verifiable native link.
+costs hundreds of tPOT (see the read-only estimates below), so per-user contracts are not viable;
+one shared deployment with a binding registry keeps the cost fixed while still giving every holder
+a verifiable native link.
 
 ## Components
 
@@ -98,9 +99,13 @@ npm run deploy:testnet
 npm run verify:deployment
 ```
 
-`deploy:testnet` writes `deployments/portaldotTestnet.json` with the contract addresses, deployment
-transaction hashes, block numbers, and token metadata. Bind the deployed tokens to their native
-counterparts afterwards:
+`deploy:testnet` runs the shared release preflight before broadcasting: chain id, deployer
+identity and mapped native account, the funding threshold on both ledgers, explicit configured
+native counterparts and their existence on the native runtime, artifact byte sizes, and the gas
+plan (see `scripts/lib/preflight.cjs`). If any check fails, nothing is signed. On success it
+writes `deployments/portaldotTestnet.json` with the contract addresses, deployment transaction
+hashes, block numbers, and token metadata. Bind the deployed tokens to their native counterparts
+afterwards:
 
 ```bash
 export POT_NATIVE_ASSET_ID=1
@@ -108,7 +113,10 @@ export POT_NATIVE_NFT_ID=1
 npm run bind:testnet
 ```
 
-`POT_NATIVE_ACCOUNT` optionally overrides the account whose commitment is stored, and
+`bind:testnet` revalidates the same preflight conditions before signing a binding, compares an
+already-bound token against the intended configuration instead of blindly accepting it, and aborts
+on any mismatch. `POT_NATIVE_ACCOUNT_EVM` optionally overrides the EVM address whose mapped
+native account commitment is stored (the legacy name `POT_NATIVE_ACCOUNT` is still accepted), and
 `POT_NATIVE_ACCOUNT_HASH` accepts a precomputed commitment.
 
 ## Scripts
@@ -119,7 +127,8 @@ npm run bind:testnet
 | `npm run abi` | Regenerate `sdk/abi.generated.mjs` from the compiled artifacts. |
 | `npm test` | Run the Hardhat contract test suite. |
 | `npm run test:sdk` | Run the shared primitive tests with the Node test runner. |
-| `npm run check` | Compile, regenerate ABIs, and run both test suites. |
+| `npm run test:release` | Run the offline release-safety tests (funding units, native Option handling, preflight ordering, gas plan, verification). |
+| `npm run check` | Compile, regenerate ABIs, and run all three test suites plus the app build. |
 | `npm run preflight` | Check the runtime, artifacts, RPC reachability, chain id, and deployed bytecode. |
 | `npm run deploy:testnet` | Deploy the three contracts to Portaldot V3 and write the deployment file. |
 | `npm run estimate:deploy` | Estimate the deployment cost of the three contracts on the live testnet through `eth_estimateGas`, without needing funds. |
@@ -138,12 +147,14 @@ npm run bind:testnet
 | `PORTALDOT_WS_URL` | Native WebSocket endpoint, defaults to `wss://test-node-v3.portaldot.dev`. |
 | `PORTALDOT_NETWORK` | Deployment file name, defaults to `portaldotTestnet`. |
 | `POT_DEPLOYMENTS` | Path to a deployment file for the verification script. |
-| `POT_GAS_LIMIT` | Gas limit used for deployment transactions, defaults to 5000000. |
+| `POT_GAS_LIMIT` | Optional fixed gas limit for deployment transactions, in the chain's gas units (BigInt-safe). If set, the preflight requires it to be a positive integer at or above the RPC's own creation estimate and at or below the block gas limit. If unset, the limit per contract is the creation estimate plus a 20 percent margin. |
 | `POT_GAS_PRICE` | Gas price used by the cost estimator, defaults to the live base fee. |
-| `POT_NATIVE_ASSET_ID` | Native asset id for the ERC-20 binding. |
-| `POT_NATIVE_NFT_ID` | Native NFT collection id for the ERC-721 binding. |
-| `POT_NATIVE_ACCOUNT` | EVM address whose native account commitment is stored. |
+| `POT_REQUIRED_TPOT` | Funding threshold override in whole tPOT, defaults to 1350. |
+| `POT_NATIVE_ASSET_ID` | Native asset id for the ERC-20 binding; required for the dual-ledger release and must exist on the native runtime. |
+| `POT_NATIVE_NFT_ID` | Native NFT collection id for the ERC-721 binding; required for the dual-ledger release and must exist on the native runtime. |
+| `POT_NATIVE_ACCOUNT_EVM` | EVM address whose native account commitment is stored; the legacy name `POT_NATIVE_ACCOUNT` is still accepted. SS58 addresses are always rejected here. |
 | `POT_NATIVE_ACCOUNT_HASH` | Precomputed SHA-256 commitment. |
+| `POT_ALLOW_UNBOUND` | Explicit opt-out allowing `verify:deployment` to pass with zero recorded bindings (`true` only). |
 
 ## Deployment cost
 
@@ -161,6 +172,16 @@ cancun evm version and optimizer 200 runs (no viaIR). Measured on the live testn
 Per-contract runtime is under the 10,240 byte Revive limit. Request at least **1,350 tPOT** for
 the deployer account; base fees vary (measured between 29,790 and 32,580 wei), so a margin is
 advisable. `npm run estimate:deploy` refreshes the numbers against the live base fee.
+
+### Gas units on this chain
+
+These are Substrate/PolkaVM-scale gas numbers, not 12-million-EVM-scale numbers: a read-only probe
+(2026-10-29) returned a block gas limit of `18446744073709551615` (`u64::MAX`) and per-contract
+creation estimates between `1.06e16` and `1.69e16` gas units, which exceed JavaScript's safe
+integer range, so they are handled as `BigInt` end to end. A fixed `POT_GAS_LIMIT` of `5,000,000`
+cannot succeed here. The release therefore never guesses: without the variable, each contract gets
+its RPC creation estimate plus a 20 percent margin; with it, the configured value must cover the
+estimate and fit within the block limit or the preflight refuses to broadcast.
 
 ## Platform facts
 

@@ -11,8 +11,9 @@ npm run check
 npm run check:funding
 ```
 
-`npm run check` compiles, regenerates the SDK ABI, and runs both test suites (72 contract tests,
-12 SDK tests). `npm run check:funding` must report `funded: true` before anything else.
+`npm run check` compiles, regenerates the SDK ABI, and runs all three test suites (72 contract
+tests, 13 SDK tests, 68 release-safety tests). `npm run check:funding` must report `funded: true`
+before anything else.
 
 ## 1. Deploy and bind (one command)
 
@@ -20,10 +21,17 @@ npm run check:funding
 npm run release:testnet
 ```
 
-That deploys `PotERC20`, `PotERC721`, and `PotRegistry`, binds the ERC-20 to native asset 1 and the
-ERC-721 to native NFT collection 1, and prints the verification report. The artifact to show is
-`deployments/portaldotTestnet.json`, which holds the contract addresses, transaction hashes, and
-block numbers.
+The release runs the shared preflight before broadcasting anything: chain id 420420777, the
+deployer identity and its mapped native account, the funding threshold on both ledgers in the
+ledger's own units, the required native asset and NFT collection, the compiled artifacts byte
+sizes, and the gas plan. Only when every preflight check passes does it deploy `PotERC20`,
+`PotERC721`, and `PotRegistry`, then bind the ERC-20 to the configured native asset and the
+ERC-721 to the configured NFT collection, then print the verification report. The artifact to show
+is `deployments/portaldotTestnet.json`, which holds the contract addresses, transaction hashes,
+block numbers, and the expected binding configuration with its transaction evidence.
+
+A preflight pass proves the configuration was safe before the first transaction, not that
+contracts are on chain. Use `verify:deployment` (included as the final step) for on-chain proof.
 
 Before running, you must set the native binding IDs:
 
@@ -33,7 +41,12 @@ export POT_NATIVE_NFT_ID=1
 ```
 
 These IDs must correspond to live native objects on the Portaldot V3 testnet (see
-`npm run dual:read` to inspect existing assets and collections).
+`npm run dual:read` to inspect existing assets and collections). The preflight rejects
+`Option::None` native objects, misconfigured ids, insufficient funding, or missing artifacts
+before signing, so an invalid id is caught with zero funds spent. The registry does not
+automatically create or synchronize native objects: create the asset and collection on the native
+side first. Restarting an intentionally unbound release is a deliberate, documented selection
+(`POT_ALLOW_UNBOUND=true` for verification) and is not part of this demo.
 
 ## 2. Show the dual ledger console
 

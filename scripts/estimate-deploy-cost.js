@@ -1,10 +1,12 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { ContractFactory, JsonRpcProvider } = require('ethers');
+const { formatUnits } = require('./lib/validation.cjs');
 
 const root = path.resolve(__dirname, '..');
 const RPC_URL = process.env.PORTALDOT_RPC_URL || 'https://test-evm-rpc-v3.portaldot.dev';
 const CHAIN_ID = 420420777;
+const EVM_DECIMALS = 18;
 const REFERENCE_FROM = '0xf7eC65d11e35375A250e474059a917B537804142';
 
 const targets = [
@@ -64,7 +66,7 @@ async function main() {
         runtimeBytes,
         gas: gas.toString(),
         costWei: cost.toString(),
-        costTPOT: Number(cost) / 1e18,
+        costTPOT: formatUnits(cost, EVM_DECIMALS),
       });
     } catch (error) {
       report.contracts.push({
@@ -78,13 +80,19 @@ async function main() {
 
   report.totalGas = totalGas.toString();
   report.totalCostWei = totalCost.toString();
-  report.totalCostTPOT = Number(totalCost) / 1e18;
-  report.recommendedFundingTPOT = Math.ceil((report.totalCostTPOT * 1.1) / 50) * 50;
+  // Exact BigInt-derived strings: tPOT values here exceed Number precision.
+  report.totalCostTPOT = formatUnits(totalCost, EVM_DECIMALS);
+  report.totalCostTPOTApproximate = Number(totalCost) / 1e18;
+  report.recommendedFundingTPOT = Math.ceil((report.totalCostTPOTApproximate * 1.1) / 50) * 50;
+  report.note =
+    'Costs are read-only estimates (creation gas x live gas price), not a guarantee of the next deployment cost.';
 
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error.stack}\n`);
-  process.exitCode = 1;
-});
+if (require.main === module) {
+  main().catch((error) => {
+    process.stderr.write(`${error.stack}\n`);
+    process.exitCode = 1;
+  });
+}

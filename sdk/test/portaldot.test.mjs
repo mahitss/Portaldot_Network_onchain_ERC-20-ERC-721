@@ -109,8 +109,19 @@ test('evmToNative converts exact amounts and rejects invalid inputs', () => {
   assert.throws(() => evmToNative('1.5'));
   assert.throws(() => evmToNative('abc'));
 
-  // Unsafe JavaScript numbers rejected (silent precision loss)
+  // Unsafe JavaScript numbers rejected
   assert.throws(() => evmToNative(12345678901234567890));
+});
+
+test('evmToNative rejects amounts exceeding uint256', () => {
+  const MAX_UINT256 = (1n << 256n) - 1n;
+
+  // Largest EVM amount divisible by CONVERSION_FACTOR converts exactly
+  const maxDivisible = (MAX_UINT256 / CONVERSION_FACTOR) * CONVERSION_FACTOR;
+  assert.equal(evmToNative(maxDivisible), maxDivisible / CONVERSION_FACTOR);
+
+  // Amount greater than MAX_UINT256 is rejected
+  assert.throws(() => evmToNative(MAX_UINT256 + 1n));
 });
 
 test('nativeToEvm converts exact amounts and rejects overflow', () => {

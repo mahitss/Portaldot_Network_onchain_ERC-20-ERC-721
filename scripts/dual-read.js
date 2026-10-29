@@ -109,7 +109,9 @@ async function main() {
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error.stack}\n`);
-  process.exitCode = 1;
-});
+if (require.main === module) {
+  main().catch((error) => {
+    process.stderr.write(`${error.stack}\n`);
+    process.exitCode = 1;
+  });
+}

@@ -21,9 +21,10 @@ Native account to fund: 5CpDHd5EAM8XefjSjNASyWArNiZjkxy4iDXGMCthN1TTrcbo
 Amount requested: 1350 tPOT
 
 This is the native account that maps to the EVM address I use for the submission
-(0x212e9F97ed3EE1f605C6132fEdB1E99606a6f4Ce). The amount is the measured cost of deploying
-three contracts (ERC-20, ERC-721, and a binding registry), estimated with eth_estimateGas:
-287.48 + 457.07 + 460.56 = 1,205.11 tPOT, plus a buffer for base-fee fluctuation.
+(0x212e9F97ed3EE1f605C6132fEdB1E99606a6f4Ce). The amount is the estimated deployment cost of
+three contracts (ERC-20, ERC-721, and a binding registry), measured with eth_estimateGas:
+287.48 + 457.07 + 460.56 = 1,205.11 tPOT, plus a buffer for base-fee fluctuation. These figures
+are read-only estimates, not a guarantee of the final deployment cost.
 
 Repository: https://github.com/mahitss/Portaldot_Network_onchain_ERC-20-ERC-721
 ```
@@ -59,9 +60,13 @@ tPOT threshold. It exits with status 1 until the account is funded.
 npm run release:testnet
 ```
 
-That deploys the three contracts, binds the ERC-20 to native asset 1 and the ERC-721 to native NFT
-collection 1, and verifies the deployment, writing `deployments/portaldotTestnet.json` with the
-addresses and transaction hashes.
+That runs the full release preflight first and only then broadcasts: it validates the chain id
+(420420777), the deployer identity and its mapped native account, the 1,350 tPOT funding threshold
+on BOTH ledgers in each ledger's own units (native 14 decimals, EVM 18 decimals), that the required
+native asset AND NFT collection are explicitly configured and exist on the native runtime, that the
+compiled artifacts are within the 10,240-byte Revive limit, and that the gas plan covers the RPC's
+own creation estimates. If any preflight check fails, the release aborts before signing anything,
+so an unfunded or misconfigured release spends nothing.
 
 Before running the release, you must also set the native binding IDs:
 
@@ -71,5 +76,12 @@ export POT_NATIVE_NFT_ID=1
 ```
 
 These values must correspond to live native objects on the Portaldot V3 testnet (see
-`npm run dual:read` to inspect existing assets and collections).
+`npm run dual:read` to inspect existing assets and collections). The preflight requires them to
+exist; neither the registry nor the release creates native objects, so fund this step only after
+the native asset and NFT collection are already in place.
+
+After deployment the release binds the tokens and writes
+`deployments/portaldotTestnet.json`. A successful preflight proves the configuration was safe
+before broadcasting; only `npm run verify:deployment` proves the deployment itself landed
+with bytecode, confirmed receipts, and the required bindings.
 ```
