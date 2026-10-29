@@ -454,6 +454,7 @@ function assessReleaseBudget({
     bindingCount: BigInt(outstandingBindings),
     bindingBudgetWei,
     subtotalWei,
+    gasPriceWei,
     feeMarginPercent,
     marginWei,
     requiredEvmWei,

@@ -22,6 +22,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { Transaction } = require('ethers');
 const {
   KIND_ERC20,
   KIND_ERC721,
@@ -488,6 +489,7 @@ async function main() {
   if (!signer) {
     throw new Error('no signer available - set PORTALDOT_DEPLOYER_PRIVATE_KEY or configure the network accounts');
   }
+  const provider = hre.ethers.provider;
   const wsUrl = process.env.PORTALDOT_WS_URL || 'wss://test-node-v3.portaldot.dev';
 
   // Read-only pre-scan so the registry contract can be wired from the
@@ -531,9 +533,34 @@ async function main() {
     bindingCount: () => registry.bindingCount(),
   };
   const bindSender = async (params, { gasLimit, onSent } = {}) => {
-    const tx = await registry.bind(...params, { gasLimit });
-    if (onSent) onSent(tx.hash);
-    return tx;
+    const data = registry.interface.encodeFunctionData('bind', [
+      params.token,
+      BigInt(params.tokenKind),
+      BigInt(params.nativeKind),
+      BigInt(params.nativeId),
+      BigInt(params.nativeDecimals),
+      BigInt(params.evmDecimals),
+      params.nativeAccountHash,
+    ]);
+    const network = await provider.getNetwork();
+    const nonce = await provider.getTransactionCount(signer.address, 'pending');
+    const tx = {
+      to: registryAddress,
+      data,
+      from: signer.address,
+      gasLimit,
+      chainId: Number(network.chainId),
+      nonce,
+    };
+    // Sign locally: derives the transaction hash without broadcasting.
+    const signed = await signer.signTransaction(tx);
+    const parsed = Transaction.from(signed);
+    const txHash = parsed.hash;
+    // Persist the pending journal entry BEFORE broadcasting the exact signed
+    // transaction. A crash now leaves a journaled txHash that can be
+    // reconciled on retry without a duplicate broadcast.
+    if (onSent) onSent(txHash);
+    return provider.broadcastTransaction(signed);
   };
   const encodeBind = (params) =>
     registry.interface.encodeFunctionData('bind', [

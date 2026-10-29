@@ -20,6 +20,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { Transaction } = require('ethers');
 const {
   CHAIN_ID,
   MAX_CODE_SIZE_BYTES,
@@ -27,6 +28,7 @@ const {
   parseFeeMarginPercent,
   validateDeploymentRecord,
   validateEvmAddress,
+  validateNativeAccountHash,
   validateNativeId,
   validateReceipt,
   formatUnits,
@@ -44,9 +46,26 @@ const root = path.resolve(__dirname, '..');
 // The dual-ledger release binds exactly two native counterparts.
 const BINDING_TOTAL = 2;
 
+// Defaults mirrored from buildPreflightConfig so the frozen release plan can
+// be validated against the environment on retry without guessing historical
+// settings.
+const DEFAULT_TOKEN_CONFIG = {
+  erc20Name: 'Portaldot Pot Token',
+  erc20Symbol: 'POT',
+  erc721Name: 'Portaldot Pot Collectibles',
+  erc721Symbol: 'POTC',
+};
+const RELEASE_PLAN_VERSION = 1;
+
 // Builds the preflight configuration from the environment. Exported so tests
 // can exercise it offline (it performs no network operations of its own).
-async function buildPreflightConfig({ env, deployerAddress, wsUrl }) {
+//
+// When `frozenPlan` is provided (a resume against an existing record that
+// carries an immutable release plan), the plan is the authoritative source
+// for token metadata, native binding targets and constructor arguments. The
+// environment is NOT allowed to drift the plan: callers must validate env
+// against the plan before calling this function.
+async function buildPreflightConfig({ env, deployerAddress, wsUrl, frozenPlan }) {
   if (!env) {
     throw new Error('environment variables are required');
   }
@@ -56,42 +75,88 @@ async function buildPreflightConfig({ env, deployerAddress, wsUrl }) {
   // (20-byte H160 + twelve 0xEE bytes, SS58 prefix 42). No network involved.
   const account = shared.evmAddressToNativeAccount(deployerEvm);
 
-  const hashOverride = env.POT_NATIVE_ACCOUNT_HASH;
+  let tokenConfig;
+  let nativeObjects;
   let nativeAccountHash;
   let commitmentSource;
-  if (hashOverride !== undefined && hashOverride !== '') {
-    nativeAccountHash = hashOverride;
-    commitmentSource = 'override';
+  let deployer;
+
+  if (frozenPlan) {
+    // Resume: the frozen release plan is authoritative. Never re-derive
+    // metadata from the environment, which could silently drift a recorded
+    // deployment.
+    if (!frozenPlan || frozenPlan.version !== RELEASE_PLAN_VERSION) {
+      throw new Error(
+        `the release plan is missing or uses an unsupported version (${frozenPlan && frozenPlan.version}). Cannot safely resume without guessing historical settings. Use POT_FORCE_FRESH_RELEASE=1 to archive and start a new release.`
+      );
+    }
+    deployer = validateEvmAddress(frozenPlan.deployer, 'release plan deployer');
+    if (!frozenPlan.tokenConfig || typeof frozenPlan.tokenConfig !== 'object') {
+      throw new Error('the release plan is missing its token configuration');
+    }
+    tokenConfig = {
+      erc20Name: frozenPlan.tokenConfig.erc20Name,
+      erc20Symbol: frozenPlan.tokenConfig.erc20Symbol,
+      erc721Name: frozenPlan.tokenConfig.erc721Name,
+      erc721Symbol: frozenPlan.tokenConfig.erc721Symbol,
+    };
+    for (const [field, value] of Object.entries(tokenConfig)) {
+      if (typeof value !== 'string' || value.length === 0 || value.length > 64) {
+        throw new Error(`the release plan token config field ${field} is invalid`);
+      }
+    }
+    if (!Array.isArray(frozenPlan.nativeObjects)) {
+      throw new Error('the release plan is missing its native binding configuration');
+    }
+    nativeObjects = frozenPlan.nativeObjects.map((object) => ({
+      kind: object.kind,
+      id: validateNativeId(object.id, `${object.kind} release plan id`),
+    }));
+    nativeAccountHash = validateNativeAccountHash(frozenPlan.nativeAccountHash, 'release plan native account hash');
+    commitmentSource = frozenPlan.commitmentSource;
+    if (commitmentSource !== 'derived' && commitmentSource !== 'override') {
+      throw new Error(`the release plan commitment source is invalid: ${commitmentSource}`);
+    }
   } else {
-    nativeAccountHash = await shared.nativeAccountHash(deployerEvm);
-    commitmentSource = 'derived';
-  }
+    // Fresh: derive everything from the environment.
+    const hashOverride = env.POT_NATIVE_ACCOUNT_HASH;
+    if (hashOverride !== undefined && hashOverride !== '') {
+      nativeAccountHash = hashOverride;
+      commitmentSource = 'override';
+    } else {
+      nativeAccountHash = await shared.nativeAccountHash(deployerEvm);
+      commitmentSource = 'derived';
+    }
 
-  // Both native counterparts must be explicitly configured. A missing value
-  // is never a silent opt-out from the dual-ledger release.
-  const assetIdRaw = env.POT_NATIVE_ASSET_ID;
-  const nftIdRaw = env.POT_NATIVE_NFT_ID;
-  const missing = [];
-  if (assetIdRaw === undefined || assetIdRaw === '') missing.push('POT_NATIVE_ASSET_ID');
-  if (nftIdRaw === undefined || nftIdRaw === '') missing.push('POT_NATIVE_NFT_ID');
-  if (missing.length > 0) {
-    throw new Error(
-      `the dual-ledger release requires both native counterparts explicitly configured; missing ${missing.join(' and ')}. A missing id is never treated as a silent opt-out.`
-    );
-  }
-  const nativeObjects = [
-    { kind: 'asset', id: validateNativeId(assetIdRaw, 'POT_NATIVE_ASSET_ID') },
-    { kind: 'nft_collection', id: validateNativeId(nftIdRaw, 'POT_NATIVE_NFT_ID') },
-  ];
+    // Both native counterparts must be explicitly configured. A missing value
+    // is never a silent opt-out from the dual-ledger release.
+    const assetIdRaw = env.POT_NATIVE_ASSET_ID;
+    const nftIdRaw = env.POT_NATIVE_NFT_ID;
+    const missing = [];
+    if (assetIdRaw === undefined || assetIdRaw === '') missing.push('POT_NATIVE_ASSET_ID');
+    if (nftIdRaw === undefined || nftIdRaw === '') missing.push('POT_NATIVE_NFT_ID');
+    if (missing.length > 0) {
+      throw new Error(
+        `the dual-ledger release requires both native counterparts explicitly configured; missing ${missing.join(' and ')}. A missing id is never treated as a silent opt-out.`
+      );
+    }
+    nativeObjects = [
+      { kind: 'asset', id: validateNativeId(assetIdRaw, 'POT_NATIVE_ASSET_ID') },
+      { kind: 'nft_collection', id: validateNativeId(nftIdRaw, 'POT_NATIVE_NFT_ID') },
+    ];
 
-  const erc20Name = env.POT_ERC20_NAME || 'Portaldot Pot Token';
-  const erc20Symbol = env.POT_ERC20_SYMBOL || 'POT';
-  const erc721Name = env.POT_ERC721_NAME || 'Portaldot Pot Collectibles';
-  const erc721Symbol = env.POT_ERC721_SYMBOL || 'POTC';
+    tokenConfig = {
+      erc20Name: env.POT_ERC20_NAME || DEFAULT_TOKEN_CONFIG.erc20Name,
+      erc20Symbol: env.POT_ERC20_SYMBOL || DEFAULT_TOKEN_CONFIG.erc20Symbol,
+      erc721Name: env.POT_ERC721_NAME || DEFAULT_TOKEN_CONFIG.erc721Name,
+      erc721Symbol: env.POT_ERC721_SYMBOL || DEFAULT_TOKEN_CONFIG.erc721Symbol,
+    };
+    deployer = deployerEvm;
+  }
 
   const artifacts = [
-    { name: 'PotERC20', file: path.join(root, 'artifacts', 'contracts', 'PotERC20.sol', 'PotERC20.json'), maxSizeBytes: MAX_CODE_SIZE_BYTES, args: [erc20Name, erc20Symbol, deployerEvm] },
-    { name: 'PotERC721', file: path.join(root, 'artifacts', 'contracts', 'PotERC721.sol', 'PotERC721.json'), maxSizeBytes: MAX_CODE_SIZE_BYTES, args: [erc721Name, erc721Symbol, deployerEvm] },
+    { name: 'PotERC20', file: path.join(root, 'artifacts', 'contracts', 'PotERC20.sol', 'PotERC20.json'), maxSizeBytes: MAX_CODE_SIZE_BYTES, args: [tokenConfig.erc20Name, tokenConfig.erc20Symbol, deployer] },
+    { name: 'PotERC721', file: path.join(root, 'artifacts', 'contracts', 'PotERC721.sol', 'PotERC721.json'), maxSizeBytes: MAX_CODE_SIZE_BYTES, args: [tokenConfig.erc721Name, tokenConfig.erc721Symbol, deployer] },
     { name: 'PotRegistry', file: path.join(root, 'artifacts', 'contracts', 'PotRegistry.sol', 'PotRegistry.json'), maxSizeBytes: MAX_CODE_SIZE_BYTES, args: [] },
   ];
 
@@ -117,7 +182,72 @@ async function buildPreflightConfig({ env, deployerAddress, wsUrl }) {
     bindingReserveCount: BINDING_TOTAL,
     bindingReserveArtifact: artifacts.find((artifact) => artifact.name === 'PotRegistry'),
     gasLimitRaw: env.POT_GAS_LIMIT ? String(env.POT_GAS_LIMIT) : null,
-    tokenConfig: { erc20Name, erc20Symbol, erc721Name, erc721Symbol },
+    tokenConfig,
+  };
+}
+
+// Validates that the current environment does not drift the frozen release
+// plan. Throws on any conflict so the release aborts before any broadcast
+// and the original record is preserved.
+function assertReleasePlanMatchesEnv(plan, env) {
+  if (!plan || !plan.tokenConfig) {
+    throw new Error('cannot validate environment against a missing release plan');
+  }
+  const tc = plan.tokenConfig;
+  const envDefaults = {
+    erc20Name: [env.POT_ERC20_NAME, DEFAULT_TOKEN_CONFIG.erc20Name],
+    erc20Symbol: [env.POT_ERC20_SYMBOL, DEFAULT_TOKEN_CONFIG.erc20Symbol],
+    erc721Name: [env.POT_ERC721_NAME, DEFAULT_TOKEN_CONFIG.erc721Name],
+    erc721Symbol: [env.POT_ERC721_SYMBOL, DEFAULT_TOKEN_CONFIG.erc721Symbol],
+  };
+  for (const [field, [envVal, defaultVal]] of Object.entries(envDefaults)) {
+    const effectiveEnv = envVal === undefined || envVal === '' ? defaultVal : envVal;
+    if (tc[field] !== effectiveEnv) {
+      throw new Error(
+        `release plan ${field} (${tc[field]}) conflicts with the configured environment value (${effectiveEnv}). ` +
+          'Refusing to drift the recorded deployment configuration. Use POT_FORCE_FRESH_RELEASE=1 to archive this record and start a new release.'
+      );
+    }
+  }
+  const planKinds = new Set((plan.nativeObjects || []).map((object) => object.kind));
+  const envKinds = new Set();
+  if (env.POT_NATIVE_ASSET_ID !== undefined && env.POT_NATIVE_ASSET_ID !== '') envKinds.add('asset');
+  if (env.POT_NATIVE_NFT_ID !== undefined && env.POT_NATIVE_NFT_ID !== '') envKinds.add('nft_collection');
+  for (const kind of ['asset', 'nft_collection']) {
+    const planned = (plan.nativeObjects || []).find((object) => object.kind === kind);
+    const configured = envKinds.has(kind);
+    if (planned && !configured) {
+      throw new Error(
+        `release plan binds native ${kind} id ${planned.id} but the environment does not configure POT_NATIVE_${kind === 'asset' ? 'ASSET' : 'NFT'}_ID. ` +
+          'Refusing to drift the recorded deployment configuration. Use POT_FORCE_FRESH_RELEASE=1 to archive this record and start a new release.'
+      );
+    }
+    if (configured && !planned) {
+      throw new Error(
+        `the environment configures POT_NATIVE_${kind === 'asset' ? 'ASSET' : 'NFT'}_ID but the release plan does not bind a ${kind}. ` +
+          'Refusing to drift the recorded deployment configuration. Use POT_FORCE_FRESH_RELEASE=1 to archive this record and start a new release.'
+      );
+    }
+  }
+  if (env.POT_NATIVE_ACCOUNT_HASH !== undefined && env.POT_NATIVE_ACCOUNT_HASH !== '' && env.POT_NATIVE_ACCOUNT_HASH !== plan.nativeAccountHash) {
+    throw new Error(
+      'POT_NATIVE_ACCOUNT_HASH conflicts with the release plan native account hash. Refusing to drift the recorded deployment configuration. ' +
+        'Use POT_FORCE_FRESH_RELEASE=1 to archive this record and start a new release.'
+    );
+  }
+}
+
+function newRecord({ config, networkName, chainId, releasePlan }) {
+  return {
+    network: networkName,
+    chainId: Number(chainId),
+    deployer: config.deployerEvm,
+    releasePlan: releasePlan || null,
+    deployedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    contracts: {},
+    tokens: {},
+    bindings: [],
   };
 }
 
@@ -202,8 +332,40 @@ async function reconcilePendingEntry(name, entry, probes) {
 }
 
 // A confirmed record entry must still hold live bytecode before it is
-// reused: the record and the chain must agree, or the run aborts.
+// reused, and its recorded transaction evidence must reconcile with the
+// chain: the receipt must exist, be successful, have a matching transaction
+// hash, and (for contract creation) its contract address must match the
+// recorded address. The record and the chain must agree, or the run aborts.
 async function verifyConfirmedEntry(name, entry, probes) {
+  const receipt = await probes.receipt(entry.txHash);
+  if (receipt === null || receipt === undefined) {
+    throw new Error(
+      `cannot reuse ${name}: receipt for recorded transaction ${entry.txHash} is not available on chain. The transaction outcome cannot be proven, so the record is not reused and nothing is redeployed. Resolve deliberately or use POT_FORCE_FRESH_RELEASE=1.`
+    );
+  }
+  validateReceipt(entry.txHash, receipt);
+  if (
+    typeof receipt.contractAddress !== 'string' ||
+    !/^0x[0-9a-fA-F]{40}$/.test(receipt.contractAddress)
+  ) {
+    throw new Error(
+      `cannot reuse ${name}: the receipt for ${entry.txHash} does not contain a usable contract-creation address; the outcome is ambiguous, refusing to reuse or redeploy`
+    );
+  }
+  if (String(receipt.contractAddress).toLowerCase() !== String(entry.address).toLowerCase()) {
+    throw new Error(
+      `cannot reuse ${name}: the receipt contract address ${receipt.contractAddress} does not match the recorded address ${entry.address}; the record and the chain disagree. Refusing to reuse or overwrite.`
+    );
+  }
+  if (
+    typeof entry.blockNumber === 'number' &&
+    typeof receipt.blockNumber === 'number' &&
+    entry.blockNumber !== receipt.blockNumber
+  ) {
+    throw new Error(
+      `cannot reuse ${name}: the recorded block number ${entry.blockNumber} does not match the receipt block number ${receipt.blockNumber}; the record and the chain disagree.`
+    );
+  }
   const code = await probes.code(entry.address);
   if (typeof code !== 'string' || code === '0x') {
     throw new Error(
@@ -248,6 +410,11 @@ async function runRelease({
     if (value === undefined) throw new Error(`runRelease: ${name} is required`);
   }
 
+  // Build the preflight config from the environment first (no frozen plan).
+  // This is needed for missing/malformed record branches below. When an
+  // existing record carries an immutable release plan, the config is rebuilt
+  // with that plan after the record is loaded and env-plan compatibility is
+  // validated.
   const config = await buildPreflightConfig({ env, deployerAddress, wsUrl });
 
   // 1. Load the existing record. Malformed or mismatched records are never
@@ -257,6 +424,7 @@ async function runRelease({
   let record = null;
   const archived = [];
   const reuseNotes = [];
+  let frozenPlan = null;
   if (loaded.status === 'missing') {
     record = newRecord({ config, networkName, chainId });
   } else if (loaded.status === 'malformed') {
@@ -308,6 +476,21 @@ async function runRelease({
     }
   }
 
+  // When resuming against an existing record that carries an immutable
+  // release plan, validate the environment against the plan before deriving
+  // the preflight config. The plan is authoritative; env drift aborts before
+  // any broadcast and preserves the original record.
+  if (record && record.releasePlan) {
+    frozenPlan = record.releasePlan;
+    assertReleasePlanMatchesEnv(frozenPlan, env);
+    const planConfig = await buildPreflightConfig({ env, deployerAddress, wsUrl, frozenPlan });
+    // Replace only the plan-derived fields; network/gas/env values stay.
+    config.nativeObjects = planConfig.nativeObjects;
+    config.tokenConfig = planConfig.tokenConfig;
+    config.commitmentSource = planConfig.commitmentSource;
+    config.nativeAccountHash = planConfig.nativeAccountHash;
+  }
+
   // 2. Reconcile: pending entries are completed from the chain (post-crash
   //    recovery); confirmed entries are re-verified against live bytecode.
   //    Both are read-only chain queries; nothing is redeployed and nothing
@@ -352,7 +535,7 @@ async function runRelease({
   record.budget = preflight.budget
     ? {
         feeMarginPercent: preflight.budget.feeMarginPercent,
-        gasPriceWei: null,
+        gasPriceWei: preflight.budget.gasPriceWei.toString(),
         deploymentBudgetWei: preflight.budget.deploymentBudgetWei.toString(),
         bindingReserveGas: preflight.budget.bindingEstimateGas.toString(),
         bindingCount: preflight.budget.bindingCount.toString(),
@@ -446,18 +629,41 @@ async function main() {
   fs.mkdirSync(directory, { recursive: true });
   const recordFile = path.join(directory, `${networkName}.json`);
 
-  // The hardhat executor forwards the onSent hook so the pending record
-  // entry is written before the receipt is awaited (crash-after-send
-  // recovery) and captures the receipt for validation.
+  // Pre-broadcast journaling executor: each deployment transaction is signed
+  // locally, its hash is derived, and the pending journal entry is persisted
+  // (via hooks.onSent) BEFORE the exact signed transaction is broadcast.
+  // This closes the broadcast-to-persistence gap: a crash between signing and
+  // broadcasting leaves a journaled pending entry that can be reconciled from
+  // its recorded transaction hash on retry, without generating a duplicate.
+  // No private key or signing secret is ever written to the journal.
+  const provider = hre.ethers.provider;
   const deployContract = async (artifact, gasLimit, hooks = {}) => {
     const factory = await hre.ethers.getContractFactory(artifact.name);
-    const contract = await factory.deploy(...artifact.args, { gasLimit });
-    const tx = contract.deploymentTransaction();
-    if (!tx) throw new Error('contract deployment did not return a transaction');
-    if (hooks.onSent) hooks.onSent(tx.hash);
-    const receipt = await tx.wait();
+    const deployTx = await factory.getDeployTransaction(...artifact.args);
+    const network = await provider.getNetwork();
+    const nonce = await provider.getTransactionCount(deployer.address, 'pending');
+    const tx = {
+      data: deployTx.data,
+      from: deployer.address,
+      gasLimit,
+      chainId: Number(network.chainId),
+      nonce,
+      ...(deployTx.maxFeePerGas !== undefined ? { maxFeePerGas: deployTx.maxFeePerGas } : {}),
+      ...(deployTx.maxPriorityFeePerGas !== undefined ? { maxPriorityFeePerGas: deployTx.maxPriorityFeePerGas } : {}),
+      ...(deployTx.gasPrice !== undefined ? { gasPrice: deployTx.gasPrice } : {}),
+    };
+    // Sign locally: derives the transaction hash without broadcasting.
+    const signed = await deployer.signTransaction(tx);
+    const parsed = Transaction.from(signed);
+    const txHash = parsed.hash;
+    // Persist the pending journal entry BEFORE broadcasting the exact signed
+    // transaction. If the process crashes now, the journaled txHash allows
+    // reconciliation on retry without a duplicate broadcast.
+    if (hooks.onSent) hooks.onSent(txHash);
+    const broadcast = await provider.broadcastTransaction(signed);
+    const receipt = await broadcast.wait();
     if (hooks.onReceipt) hooks.onReceipt(receipt);
-    return { txHash: tx.hash, receipt, address: await contract.getAddress() };
+    return { txHash, receipt, address: broadcast.contractAddress };
   };
 
   await runRelease({

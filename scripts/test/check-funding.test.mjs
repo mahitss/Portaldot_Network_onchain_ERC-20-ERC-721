@@ -325,3 +325,24 @@ test('assessReleaseBudget round-trips the live 2026-10-29 measurements into the 
   // the old 1,350 tPOT fixed recommendation is PROVABLY insufficient for the whole release
   assert.ok(1350n * 10n ** 18n < budget.requiredEvmWei);
 });
+
+test('assessReleaseBudget persists the actual gas price used (not null) in budget evidence', () => {
+  const budget = assessReleaseBudget({
+    creationEstimatesGas: [E20],
+    bindingEstimateGas: ER,
+    outstandingBindings: 1,
+    gasPriceWei: GAS,
+    feeMarginPercent: 20,
+  });
+  assert.equal(budget.gasPriceWei, GAS, 'gasPriceWei must be stored, not null');
+  // recompute the deployment budget from stored inputs to prove truthfulness
+  const expectedDeployment = E20 * GAS;
+  assert.equal(budget.deploymentBudgetWei, expectedDeployment);
+  const expectedBinding = ER * 1n * GAS;
+  assert.equal(budget.bindingBudgetWei, expectedBinding);
+  const expectedSubtotal = expectedDeployment + expectedBinding;
+  assert.equal(budget.subtotalWei, expectedSubtotal);
+  const expectedMargin = ceilDiv(expectedSubtotal * 20n, 100n);
+  assert.equal(budget.marginWei, expectedMargin);
+  assert.equal(budget.requiredEvmWei, expectedSubtotal + expectedMargin);
+});

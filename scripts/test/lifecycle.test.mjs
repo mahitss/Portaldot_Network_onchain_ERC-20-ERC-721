@@ -32,6 +32,9 @@ const REGISTRY_ADDR = `0x${'33'.repeat(20)}`;
 const TOKEN_ERC20 = `0x${'44'.repeat(20)}`;
 const TOKEN_ERC721 = `0x${'55'.repeat(20)}`;
 
+// Mirrors scripts/deploy.js RELEASE_PLAN_VERSION (not exported, kept in sync).
+const RELEASE_PLAN_VERSION = 1;
+
 const COMMITMENT = `0x${createHash('sha256').update(Buffer.from(`${DEPLOYER.slice(2)}${'ee'.repeat(12)}`, 'hex')).digest('hex')}`;
 
 function tempFile() {
@@ -128,7 +131,8 @@ function RELEASE_ADDRESS(name) {
 
 // A mock transaction hash with exactly 64 hex characters after 0x.
 function mockTxHash(suffix = 'dd') {
-  return `0x${suffix.padEnd(64, suffix).slice(0, 64)}`;
+  const hexSuffix = suffix.replace(/[^0-9a-f]/g, 'd');
+  return `0x${hexSuffix.padEnd(64, hexSuffix).slice(0, 64)}`;
 }
 
 async function fullEnv() {
@@ -299,6 +303,11 @@ test('rerun with a complete record: zero deployments, nothing broadcast', async 
       [TOKEN_ERC721]: `0x${'ff'.repeat(200)}`,
       [REGISTRY_ADDR]: `0x${'ff'.repeat(200)}`,
     },
+    receipts: {
+      [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
+      [`0x${'bb'.repeat(32)}`]: { status: 1, blockNumber: 2, transactionHash: `0x${'bb'.repeat(32)}`, contractAddress: TOKEN_ERC721 },
+      [`0x${'cc'.repeat(32)}`]: { status: 1, blockNumber: 3, transactionHash: `0x${'cc'.repeat(32)}`, contractAddress: REGISTRY_ADDR },
+    },
   });
   let sent = 0;
   const deployContract = async () => { sent += 1; return deployResult('PotERC20', `0x${'ee'.repeat(32)}`); };
@@ -334,6 +343,9 @@ test('partial deployment resumes without duplicate deployment transactions', asy
     evmBalance: 10_000n * 10n ** 18n,
     nativeFree: 10_000n * 10n ** 14n,
     codes: { [TOKEN_ERC20]: `0x${'ff'.repeat(200)}` },
+    receipts: {
+      [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
+    },
   });
   const sentTx = [];
   const deployContract = async (artifact) => {
@@ -689,6 +701,768 @@ test('binding: accepts a balance below the whole-release requirement (remaining-
 
 test('binding: malformed deployment record aborts before any binding', async () => {
   await assert.rejects(() => bindingHarness('MALFORMED'), /malformed|valid release record/);
+});
+
+// ------------------------------------------------------------
+// 4. Objective A: Frozen release plan (immutable configuration)
+// ------------------------------------------------------------
+
+function recordWithPlan(tokenConfigOverrides = {}, nativeObjectsOverrides = []) {
+  const r = JSON.parse(JSON.stringify(existingRecord));
+  r.releasePlan = {
+    version: RELEASE_PLAN_VERSION,
+    deployer: DEPLOYER,
+    tokenConfig: {
+      erc20Name: tokenConfigOverrides.erc20Name ?? 'Custom Token',
+      erc20Symbol: tokenConfigOverrides.erc20Symbol ?? 'CUSTOM',
+      erc721Name: tokenConfigOverrides.erc721Name ?? 'Custom Collectibles',
+      erc721Symbol: tokenConfigOverrides.erc721Symbol ?? 'CUSTC',
+    },
+    nativeObjects: nativeObjectsOverrides.length > 0
+      ? nativeObjectsOverrides
+      : [
+          { kind: 'asset', id: 1 },
+          { kind: 'nft_collection', id: 2 },
+        ],
+    nativeAccountHash: COMMITMENT,
+    commitmentSource: 'derived',
+  };
+  return r;
+}
+
+// Partial record that only has PotERC20 confirmed (for resume tests)
+function partialRecordWithPlan(tokenConfigOverrides = {}) {
+  const r = recordWithPlan(tokenConfigOverrides);
+  r.contracts = { PotERC20: existingRecord.contracts.PotERC20 };
+  r.tokens = { erc20: { address: TOKEN_ERC20, name: r.releasePlan.tokenConfig.erc20Name, symbol: r.releasePlan.tokenConfig.erc20Symbol, decimals: 18 } };
+  return r;
+}
+
+test('Objective A: completed release cannot have names/symbols changed by different env vars', async () => {
+  const recordFile = tempFile();
+  const recordIo = makeRecordIo(recordWithPlan());
+  // Only PotERC20 needs a receipt/code since it's confirmed; the others are outstanding
+  const probes = makeProbes({
+    evmBalance: 10_000n * 10n ** 18n,
+    nativeFree: 10_000n * 10n ** 14n,
+    codes: {
+      [TOKEN_ERC20]: `0x${'ff'.repeat(200)}`,
+    },
+    receipts: {
+      [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
+    },
+  });
+  // Env has DIFFERENT names than the frozen plan → must abort
+  const driftingEnv = {
+    ...probeEnv(),
+    POT_ERC20_NAME: 'Different Token',
+  };
+
+  await assert.rejects(() => runRelease({
+    env: driftingEnv,
+    deployerAddress: DEPLOYER,
+    recordIo,
+    probes,
+    deployContract: async () => deployResult('PotERC20', `0x${'ee'.repeat(32)}`),
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+  }), /release plan.*erc20Name.*conflicts|drift/);
+
+  // Original record is preserved unchanged
+  assert.equal(recordIo.state().releasePlan.tokenConfig.erc20Name, 'Custom Token');
+});
+
+test('Objective A: partial release cannot resume with conflicting constructor settings', async () => {
+  const recordFile = tempFile();
+  const recordIo = makeRecordIo(partialRecordWithPlan());
+  const probes = makeProbes({
+    evmBalance: 10_000n * 10n ** 18n,
+    nativeFree: 10_000n * 10n ** 14n,
+    codes: {
+      [TOKEN_ERC20]: `0x${'ff'.repeat(200)}`,
+    },
+    receipts: {
+      [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
+    },
+  });
+  // Env has a different symbol than the frozen plan → must abort before deploying anything
+  const driftingEnv = {
+    ...probeEnv(),
+    POT_ERC20_SYMBOL: 'DIFFERENT',
+  };
+  let sent = 0;
+  const deployContract = async () => { sent += 1; return deployResult('PotERC721', `0x${'ee'.repeat(32)}`); };
+
+  await assert.rejects(() => runRelease({
+    env: driftingEnv,
+    deployerAddress: DEPLOYER,
+    recordIo,
+    probes,
+    deployContract,
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+  }), /release plan.*erc20Symbol.*conflicts|drift/);
+  assert.equal(sent, 0, 'no deployment may proceed when constructor settings conflict with the frozen plan');
+});
+
+test('Objective A: normal retry with unchanged settings reuses existing deployments without duplicates', async () => {
+  const recordFile = tempFile();
+  const recordIo = makeRecordIo(recordWithPlan());
+  const probes = makeProbes({
+    evmBalance: 10_000n * 10n ** 18n,
+    nativeFree: 10_000n * 10n ** 14n,
+    codes: {
+      [TOKEN_ERC20]: `0x${'ff'.repeat(200)}`,
+      [TOKEN_ERC721]: `0x${'ff'.repeat(200)}`,
+      [REGISTRY_ADDR]: `0x${'ff'.repeat(200)}`,
+    },
+    receipts: {
+      [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
+      [`0x${'bb'.repeat(32)}`]: { status: 1, blockNumber: 2, transactionHash: `0x${'bb'.repeat(32)}`, contractAddress: TOKEN_ERC721 },
+      [`0x${'cc'.repeat(32)}`]: { status: 1, blockNumber: 3, transactionHash: `0x${'cc'.repeat(32)}`, contractAddress: REGISTRY_ADDR },
+    },
+  });
+  let sent = 0;
+  const deployContract = async () => { sent += 1; return deployResult('PotERC20', `0x${'ee'.repeat(32)}`); };
+
+  const result = await runRelease({
+    env: {
+      ...probeEnv(),
+      POT_ERC20_NAME: 'Custom Token',
+      POT_ERC20_SYMBOL: 'CUSTOM',
+      POT_ERC721_NAME: 'Custom Collectibles',
+      POT_ERC721_SYMBOL: 'CUSTC',
+    },
+    deployerAddress: DEPLOYER,
+    recordIo,
+    probes,
+    deployContract,
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+  });
+  assert.equal(result.sentCount, 0, 'no deployments on retry with unchanged settings');
+  assert.equal(result.reusedCount, 3);
+  assert.equal(sent, 0);
+  // Plan is untouched
+  assert.equal(recordIo.state().releasePlan.tokenConfig.erc20Name, 'Custom Token');
+});
+
+test('Objective A: explicit fresh release archives the previous record before beginning a new plan', async () => {
+  const recordFile = tempFile();
+  const recordIo = makeRecordIo(recordWithPlan());
+  const probes = makeProbes({ evmBalance: 10_000n * 10n ** 18n, nativeFree: 10_000n * 10n ** 14n });
+  let sent = 0;
+  const deployContract = async (artifact) => {
+    sent += 1;
+    const txHash = mockTxHash('dd' + sent);
+    const receipt = { status: 1, blockNumber: 50 + sent, transactionHash: txHash, contractAddress: RELEASE_ADDRESS(artifact.name) };
+    return deployResult(artifact.name, txHash, receipt);
+  };
+
+  const result = await runRelease({
+    env: probeEnv(),
+    deployerAddress: DEPLOYER,
+    recordIo,
+    probes,
+    deployContract,
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+    forceFresh: true,
+  });
+  assert.equal(result.sentCount, 3);
+  assert.ok(result.archived, 'previous record must be archived before starting a new plan');
+});
+
+// ------------------------------------------------------------
+// 5. Objective C: Recorded deployment verification before reuse
+// ------------------------------------------------------------
+
+function verifiedRecordWithEntry(entry) {
+  const r = JSON.parse(JSON.stringify(existingRecord));
+  r.contracts = { PotERC20: entry };
+  r.tokens = { erc20: { address: entry.address, name: 'Custom Token', symbol: 'CUSTOM', decimals: 18 } };
+  r.releasePlan = {
+    version: RELEASE_PLAN_VERSION,
+    deployer: DEPLOYER,
+    tokenConfig: { erc20Name: 'Custom Token', erc20Symbol: 'CUSTOM', erc721Name: 'Custom Collectibles', erc721Symbol: 'CUSTC' },
+    nativeObjects: [{ kind: 'asset', id: 1 }, { kind: 'nft_collection', id: 2 }],
+    nativeAccountHash: COMMITMENT,
+    commitmentSource: 'derived',
+  };
+  return r;
+}
+
+test('Objective C: confirmed entry with no receipt on chain aborts before reuse', async () => {
+  const recordFile = tempFile();
+  const recordIo = makeRecordIo(verifiedRecordWithEntry({
+    address: TOKEN_ERC20,
+    txHash: `0x${'aa'.repeat(32)}`,
+    blockNumber: 1,
+    status: 'confirmed',
+  }));
+  const probes = makeProbes({
+    evmBalance: 10_000n * 10n ** 18n,
+    nativeFree: 10_000n * 10n ** 14n,
+    codes: { [TOKEN_ERC20]: `0x${'ff'.repeat(200)}` },
+    // No receipts → ambiguous
+  });
+  let sent = 0;
+  const deployContract = async () => { sent += 1; return deployResult('PotERC20', `0x${'ee'.repeat(32)}`); };
+
+  await assert.rejects(() => runRelease({
+    env: {
+      ...probeEnv(),
+      POT_ERC20_NAME: 'Custom Token',
+      POT_ERC20_SYMBOL: 'CUSTOM',
+      POT_ERC721_NAME: 'Custom Collectibles',
+      POT_ERC721_SYMBOL: 'CUSTC',
+    },
+    deployerAddress: DEPLOYER,
+    recordIo,
+    probes,
+    deployContract,
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+  }), /no receipt on chain|cannot be proven/);
+  assert.equal(sent, 0, 'no new broadcast when receipt is unavailable');
+});
+
+test('Objective C: confirmed entry with mismatched contract address aborts before reuse', async () => {
+  const recordFile = tempFile();
+  const wrongAddress = `0x${'99'.repeat(20)}`;
+  const recordIo = makeRecordIo(verifiedRecordWithEntry({
+    address: wrongAddress,
+    txHash: `0x${'aa'.repeat(32)}`,
+    blockNumber: 1,
+    status: 'confirmed',
+  }));
+  const probes = makeProbes({
+    evmBalance: 10_000n * 10n ** 18n,
+    nativeFree: 10_000n * 10n ** 14n,
+    codes: { [TOKEN_ERC20]: `0x${'ff'.repeat(200)}` },
+    receipts: {
+      [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
+    },
+  });
+  let sent = 0;
+  const deployContract = async () => { sent += 1; return deployResult('PotERC20', `0x${'ee'.repeat(32)}`); };
+
+  await assert.rejects(() => runRelease({
+    env: {
+      ...probeEnv(),
+      POT_ERC20_NAME: 'Custom Token',
+      POT_ERC20_SYMBOL: 'CUSTOM',
+      POT_ERC721_NAME: 'Custom Collectibles',
+      POT_ERC721_SYMBOL: 'CUSTC',
+    },
+    deployerAddress: DEPLOYER,
+    recordIo,
+    probes,
+    deployContract,
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+  }), /does not match the recorded address/);
+  assert.equal(sent, 0);
+});
+
+test('Objective C: confirmed entry with failed receipt status aborts before reuse', async () => {
+  const recordFile = tempFile();
+  const recordIo = makeRecordIo(verifiedRecordWithEntry({
+    address: TOKEN_ERC20,
+    txHash: `0x${'aa'.repeat(32)}`,
+    blockNumber: 1,
+    status: 'confirmed',
+  }));
+  const probes = makeProbes({
+    evmBalance: 10_000n * 10n ** 18n,
+    nativeFree: 10_000n * 10n ** 14n,
+    codes: { [TOKEN_ERC20]: `0x${'ff'.repeat(200)}` },
+    receipts: {
+      [`0x${'aa'.repeat(32)}`]: { status: 0, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
+    },
+  });
+  let sent = 0;
+  const deployContract = async () => { sent += 1; return deployResult('PotERC20', `0x${'ee'.repeat(32)}`); };
+
+  await assert.rejects(() => runRelease({
+    env: {
+      ...probeEnv(),
+      POT_ERC20_NAME: 'Custom Token',
+      POT_ERC20_SYMBOL: 'CUSTOM',
+      POT_ERC721_NAME: 'Custom Collectibles',
+      POT_ERC721_SYMBOL: 'CUSTC',
+    },
+    deployerAddress: DEPLOYER,
+    recordIo,
+    probes,
+    deployContract,
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+  }), /failed with status/);
+  assert.equal(sent, 0);
+});
+
+test('Objective C: confirmed entry with missing bytecode aborts before reuse', async () => {
+  const recordFile = tempFile();
+  const recordIo = makeRecordIo(verifiedRecordWithEntry({
+    address: TOKEN_ERC20,
+    txHash: `0x${'aa'.repeat(32)}`,
+    blockNumber: 1,
+    status: 'confirmed',
+  }));
+  const probes = makeProbes({
+    evmBalance: 10_000n * 10n ** 18n,
+    nativeFree: 10_000n * 10n ** 14n,
+    // No codes → returns '0x' (no bytecode)
+    receipts: {
+      [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
+    },
+  });
+  let sent = 0;
+  const deployContract = async () => { sent += 1; return deployResult('PotERC20', `0x${'ee'.repeat(32)}`); };
+
+  await assert.rejects(() => runRelease({
+    env: {
+      ...probeEnv(),
+      POT_ERC20_NAME: 'Custom Token',
+      POT_ERC20_SYMBOL: 'CUSTOM',
+      POT_ERC721_NAME: 'Custom Collectibles',
+      POT_ERC721_SYMBOL: 'CUSTC',
+    },
+    deployerAddress: DEPLOYER,
+    recordIo,
+    probes,
+    deployContract,
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+  }), /no bytecode/);
+  assert.equal(sent, 0);
+});
+
+test('Objective C: confirmed entry with inconsistent block number aborts before reuse', async () => {
+  const recordFile = tempFile();
+  const recordIo = makeRecordIo(verifiedRecordWithEntry({
+    address: TOKEN_ERC20,
+    txHash: `0x${'aa'.repeat(32)}`,
+    blockNumber: 999,
+    status: 'confirmed',
+  }));
+  const probes = makeProbes({
+    evmBalance: 10_000n * 10n ** 18n,
+    nativeFree: 10_000n * 10n ** 14n,
+    codes: { [TOKEN_ERC20]: `0x${'ff'.repeat(200)}` },
+    receipts: {
+      [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
+    },
+  });
+  let sent = 0;
+  const deployContract = async () => { sent += 1; return deployResult('PotERC20', `0x${'ee'.repeat(32)}`); };
+
+  await assert.rejects(() => runRelease({
+    env: {
+      ...probeEnv(),
+      POT_ERC20_NAME: 'Custom Token',
+      POT_ERC20_SYMBOL: 'CUSTOM',
+      POT_ERC721_NAME: 'Custom Collectibles',
+      POT_ERC721_SYMBOL: 'CUSTC',
+    },
+    deployerAddress: DEPLOYER,
+    recordIo,
+    probes,
+    deployContract,
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+  }), /block number/);
+  assert.equal(sent, 0);
+});
+
+test('Objective C: verified confirmed entries are reused without duplicate deployment', async () => {
+  const recordFile = tempFile();
+  const recordIo = makeRecordIo(verifiedRecordWithEntry({
+    address: TOKEN_ERC20,
+    txHash: `0x${'aa'.repeat(32)}`,
+    blockNumber: 1,
+    status: 'confirmed',
+  }));
+  const probes = makeProbes({
+    evmBalance: 10_000n * 10n ** 18n,
+    nativeFree: 10_000n * 10n ** 14n,
+    codes: {
+      [TOKEN_ERC20]: `0x${'ff'.repeat(200)}`,
+      [TOKEN_ERC721]: `0x${'ff'.repeat(200)}`,
+      [REGISTRY_ADDR]: `0x${'ff'.repeat(200)}`,
+    },
+    receipts: {
+      [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
+      [`0x${'bb'.repeat(32)}`]: { status: 1, blockNumber: 2, transactionHash: `0x${'bb'.repeat(32)}`, contractAddress: TOKEN_ERC721 },
+      [`0x${'cc'.repeat(32)}`]: { status: 1, blockNumber: 3, transactionHash: `0x${'cc'.repeat(32)}`, contractAddress: REGISTRY_ADDR },
+    },
+  });
+  let sent = 0;
+  const deployContract = async () => { sent += 1; return deployResult('PotERC20', `0x${'ee'.repeat(32)}`); };
+
+  const result = await runRelease({
+    env: {
+      ...probeEnv(),
+      POT_ERC20_NAME: 'Custom Token',
+      POT_ERC20_SYMBOL: 'CUSTOM',
+      POT_ERC721_NAME: 'Custom Collectibles',
+      POT_ERC721_SYMBOL: 'CUSTC',
+    },
+    deployerAddress: DEPLOYER,
+    recordIo,
+    probes,
+    deployContract,
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+  });
+  assert.equal(result.sentCount, 2, 'only outstanding contracts deployed');
+  assert.equal(result.reusedCount, 1, 'verified contract reused');
+  assert.equal(sent, 2, 'deployContract called only for outstanding contracts');
+});
+
+// ------------------------------------------------------------
+// 6. Objective B: Pre-broadcast journaling fault injection
+// ------------------------------------------------------------
+
+// deployContract that simulates pre-broadcast journaling:
+// 1. derive txHash, 2. call onSent (persist pending), 3. broadcast (or fail)
+function journalingDeployContract(opts = {}) {
+  const {
+    shouldThrowAfterOnSent = false,
+    shouldThrowAfterBroadcast = false,
+    receipts = {},
+    codes = {},
+    broadcastHashes = {},
+    calls = [],
+  } = opts;
+  let seq = 0;
+  return async (artifact, gasLimit, hooks) => {
+    seq += 1;
+    const index = seq - 1;
+    const txHash = mockTxHash('jj' + seq);
+    const receipt = receipts[txHash] || { status: 1, blockNumber: 10 + seq, transactionHash: txHash, contractAddress: RELEASE_ADDRESS(artifact.name) };
+    // Step 1: derive hash, persist pending (onSent) BEFORE broadcast
+    if (hooks.onSent) hooks.onSent(txHash);
+    // Simulate crash between journaling and broadcast
+    if (shouldThrowAfterOnSent) {
+      throw new Error('crash after journaling, before broadcast');
+    }
+    // Step 2: broadcast (simulated by returning a tx object)
+    const broadcastTx = { hash: txHash, wait: async () => receipt };
+    // Simulate crash/write failure after broadcast
+    if (shouldThrowAfterBroadcast) {
+      throw new Error('crash after broadcast, before persistence complete');
+    }
+    if (hooks.onReceipt) hooks.onReceipt(receipt);
+    return { txHash, receipt, address: receipt.contractAddress };
+  };
+}
+
+test('Objective B: crash before broadcast - journaled pending entry reconciled on retry, no duplicate', async () => {
+  const recordFile = tempFile();
+  const recordIo = makeRecordIo(null);
+  const txHash = mockTxHash('jj1');
+  // First run: journal pending then crash before broadcast
+  const crashingDeploy = journalingDeployContract({ shouldThrowAfterOnSent: true });
+  let sent1 = 0;
+  const deploy1 = async (artifact, gasLimit, hooks) => {
+    sent1 += 1;
+    return crashingDeploy(artifact, gasLimit, hooks);
+  };
+
+  const probes = makeProbes({
+    evmBalance: 10_000n * 10n ** 18n,
+    nativeFree: 10_000n * 10n ** 14n,
+  });
+  // env with custom names matching plan
+  const planEnv = {
+    ...probeEnv(),
+    POT_ERC20_NAME: 'Custom Token',
+    POT_ERC20_SYMBOL: 'CUSTOM',
+    POT_ERC721_NAME: 'Custom Collectibles',
+    POT_ERC721_SYMBOL: 'CUSTC',
+  };
+
+  // First run crashes after journaling PotERC20
+  await assert.rejects(() => runRelease({
+    env: planEnv,
+    deployerAddress: DEPLOYER,
+    recordIo,
+    probes,
+    deployContract: deploy1,
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+  }), /crash after journaling/);
+  assert.equal(sent1, 1, 'one deployment attempted before crash');
+  const afterCrash = recordIo.state();
+  assert.equal(afterCrash.contracts.PotERC20.status, 'pending', 'pending entry journaled before broadcast');
+  assert.equal(afterCrash.contracts.PotERC20.txHash, txHash, 'journaled txHash recorded');
+
+  // Second run: receipt now available on chain → reconcile, no redeploy
+  const probes2 = makeProbes({
+    evmBalance: 10_000n * 10n ** 18n,
+    nativeFree: 10_000n * 10n ** 14n,
+    codes: {
+      [TOKEN_ERC20]: `0x${'ff'.repeat(200)}`,
+      [TOKEN_ERC721]: `0x${'ff'.repeat(200)}`,
+      [REGISTRY_ADDR]: `0x${'ff'.repeat(200)}`,
+    },
+    receipts: {
+      [txHash]: { status: 1, blockNumber: 42, transactionHash: txHash, contractAddress: TOKEN_ERC20 },
+    },
+  });
+  let sent2 = 0;
+  const deploy2 = async (artifact, gasLimit, hooks) => {
+    sent2 += 1;
+    const h = mockTxHash('jj2' + sent2);
+    const r = { status: 1, blockNumber: 50 + sent2, transactionHash: h, contractAddress: RELEASE_ADDRESS(artifact.name) };
+    if (hooks.onSent) hooks.onSent(h);
+    if (hooks.onReceipt) hooks.onReceipt(r);
+    return { txHash: h, receipt: r, address: r.contractAddress };
+  };
+
+  const result = await runRelease({
+    env: planEnv,
+    deployerAddress: DEPLOYER,
+    recordIo,
+    probes: probes2,
+    deployContract: deploy2,
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+  });
+  assert.equal(sent2, 2, 'only PotERC721 and PotRegistry deployed (PotERC20 reconciled)');
+  const final = recordIo.state();
+  assert.equal(final.contracts.PotERC20.status, 'confirmed');
+  assert.equal(final.contracts.PotERC20.txHash, txHash, 'reconciled from journaled txHash, not redeployed');
+  assert.equal(final.contracts.PotERC20.blockNumber, 42);
+});
+
+test('Objective B: crash after broadcast - pending entry persists, retry reconciles without duplicate broadcast', async () => {
+  const recordFile = tempFile();
+  const recordIo = makeRecordIo(null);
+  const txHash = mockTxHash('jj1');
+  // deployContract: journal pending (onSent), then throw after broadcast
+  const crashingDeploy = journalingDeployContract({ shouldThrowAfterBroadcast: true });
+  let sent = 0;
+  const deployContract = async (artifact, gasLimit, hooks) => {
+    sent += 1;
+    return crashingDeploy(artifact, gasLimit, hooks);
+  };
+
+  const probes = makeProbes({
+    evmBalance: 10_000n * 10n ** 18n,
+    nativeFree: 10_000n * 10n ** 14n,
+  });
+  const planEnv = {
+    ...probeEnv(),
+    POT_ERC20_NAME: 'Custom Token',
+    POT_ERC20_SYMBOL: 'CUSTOM',
+    POT_ERC721_NAME: 'Custom Collectibles',
+    POT_ERC721_SYMBOL: 'CUSTC',
+  };
+
+  await assert.rejects(() => runRelease({
+    env: planEnv,
+    deployerAddress: DEPLOYER,
+    recordIo,
+    probes,
+    deployContract,
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+  }), /crash after broadcast/);
+  assert.equal(sent, 1, 'broadcast was attempted once before crash');
+  const afterCrash = recordIo.state();
+  assert.equal(afterCrash.contracts.PotERC20.status, 'pending', 'pending entry persists after broadcast crash');
+  assert.equal(afterCrash.contracts.PotERC20.txHash, txHash);
+
+  // Retry: receipt available → reconcile, no duplicate
+  const probes2 = makeProbes({
+    evmBalance: 10_000n * 10n ** 18n,
+    nativeFree: 10_000n * 10n ** 14n,
+    codes: {
+      [TOKEN_ERC20]: `0x${'ff'.repeat(200)}`,
+      [TOKEN_ERC721]: `0x${'ff'.repeat(200)}`,
+      [REGISTRY_ADDR]: `0x${'ff'.repeat(200)}`,
+    },
+    receipts: {
+      [txHash]: { status: 1, blockNumber: 43, transactionHash: txHash, contractAddress: TOKEN_ERC20 },
+    },
+  });
+  let sent2 = 0;
+  const deploy2 = async () => { sent2 += 1; return deployResult('PotERC721', `0x${'ee'.repeat(32)}`); };
+
+  const result = await runRelease({
+    env: planEnv,
+    deployerAddress: DEPLOYER,
+    recordIo,
+    probes: probes2,
+    deployContract: deploy2,
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+  });
+  assert.equal(sent2, 2, 'no duplicate broadcast for journaled transaction');
+  const final = recordIo.state();
+  assert.equal(final.contracts.PotERC20.status, 'confirmed');
+  assert.equal(final.contracts.PotERC20.txHash, txHash, 'same txHash reused, not a new broadcast');
+});
+
+test('Objective B: no receipt and genuinely ambiguous state aborts fail-closed', async () => {
+  const recordFile = tempFile();
+  const recordIo = makeRecordIo(null);
+  const txHash = mockTxHash('jj1');
+  const crashingDeploy = journalingDeployContract({ shouldThrowAfterBroadcast: true });
+  let sent = 0;
+  const deployContract = async (artifact, gasLimit, hooks) => {
+    sent += 1;
+    return crashingDeploy(artifact, gasLimit, hooks);
+  };
+
+  const probes = makeProbes({
+    evmBalance: 10_000n * 10n ** 18n,
+    nativeFree: 10_000n * 10n ** 14n,
+  });
+  const planEnv = {
+    ...probeEnv(),
+    POT_ERC20_NAME: 'Custom Token',
+    POT_ERC20_SYMBOL: 'CUSTOM',
+    POT_ERC721_NAME: 'Custom Collectibles',
+    POT_ERC721_SYMBOL: 'CUSTC',
+  };
+
+  await assert.rejects(() => runRelease({
+    env: planEnv,
+    deployerAddress: DEPLOYER,
+    recordIo,
+    probes,
+    deployContract,
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+  }), /crash after broadcast/);
+
+  // Retry with NO receipt → genuinely ambiguous, abort fail-closed
+  const probes2 = makeProbes({
+    evmBalance: 10_000n * 10n ** 18n,
+    nativeFree: 10_000n * 10n ** 14n,
+    // no receipts → ambiguous
+  });
+  let sent2 = 0;
+  const deploy2 = async () => { sent2 += 1; return deployResult('PotERC721', `0x${'ee'.repeat(32)}`); };
+
+  await assert.rejects(() => runRelease({
+    env: planEnv,
+    deployerAddress: DEPLOYER,
+    recordIo,
+    probes: probes2,
+    deployContract: deploy2,
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+  }), /has no receipt yet|cannot be proven/);
+  assert.equal(sent2, 0, 'no new broadcast for ambiguous transaction');
+  const final = recordIo.state();
+  assert.equal(final.contracts.PotERC20.status, 'pending', 'pending entry preserved, not overwritten');
+});
+
+test('Objective B: receipt success followed by persistence failure aborts without losing evidence', async () => {
+  const recordFile = tempFile();
+  let store = null;
+  let writeCount = 0;
+  const faultyRecordIo = {
+    read: (file) => {
+      if (store === null) return { status: 'missing', data: null, error: null };
+      return { status: 'ok', data: JSON.parse(JSON.stringify(store)), error: null };
+    },
+    write: (file, value) => {
+      writeCount += 1;
+      // Fail on the confirmed-entry write (write #3: #1 budget at step 5,
+      // #2 pending via onSent, #3 confirmed after deployContract returns)
+      if (writeCount === 3) {
+        throw new Error('disk write failure after receipt');
+      }
+      store = JSON.parse(JSON.stringify(value));
+    },
+    archive: (file) => null,
+    state: () => store,
+  };
+  const txHash = mockTxHash('dd1');
+  const receipt = { status: 1, blockNumber: 44, transactionHash: txHash, contractAddress: TOKEN_ERC20 };
+  let sent = 0;
+  const deployContract = async (artifact, gasLimit, hooks) => {
+    sent += 1;
+    if (hooks.onSent) hooks.onSent(txHash);
+    if (hooks.onReceipt) hooks.onReceipt(receipt);
+    return { txHash, receipt, address: TOKEN_ERC20 };
+  };
+
+  const probes = makeProbes({
+    evmBalance: 10_000n * 10n ** 18n,
+    nativeFree: 10_000n * 10n ** 14n,
+  });
+  const planEnv = {
+    ...probeEnv(),
+    POT_ERC20_NAME: 'Custom Token',
+    POT_ERC20_SYMBOL: 'CUSTOM',
+    POT_ERC721_NAME: 'Custom Collectibles',
+    POT_ERC721_SYMBOL: 'CUSTC',
+  };
+
+  await assert.rejects(() => runRelease({
+    env: planEnv,
+    deployerAddress: DEPLOYER,
+    recordIo: faultyRecordIo,
+    probes,
+    deployContract,
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+  }), /disk write failure/);
+  assert.equal(sent, 1, 'broadcast and receipt succeeded, persistence of confirmed entry failed');
+  const afterFailureState = faultyRecordIo.state();
+  assert.equal(afterFailureState.contracts.PotERC20.status, 'pending', 'pending entry persisted before confirmed-entry write failed');
+
+  // Retry with the state from the failed run and receipt on chain → reconcile
+  const probes2 = makeProbes({
+    evmBalance: 10_000n * 10n ** 18n,
+    nativeFree: 10_000n * 10n ** 14n,
+    codes: {
+      [TOKEN_ERC20]: `0x${'ff'.repeat(200)}`,
+      [TOKEN_ERC721]: `0x${'ff'.repeat(200)}`,
+      [REGISTRY_ADDR]: `0x${'ff'.repeat(200)}`,
+    },
+    receipts: {
+      [txHash]: { status: 1, blockNumber: 44, transactionHash: txHash, contractAddress: TOKEN_ERC20 },
+    },
+  });
+  let sent2 = 0;
+  const deploy2 = async () => { sent2 += 1; return deployResult('PotERC721', `0x${'ee'.repeat(32)}`); };
+
+  const result = await runRelease({
+    env: planEnv,
+    deployerAddress: DEPLOYER,
+    recordIo: makeRecordIo(afterFailureState),
+    probes: probes2,
+    deployContract: deploy2,
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+  });
+  assert.equal(sent2, 2, 'no duplicate broadcast after recovery');
 });
 
 
