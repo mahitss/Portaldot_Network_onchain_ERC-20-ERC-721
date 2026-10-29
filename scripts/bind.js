@@ -1,17 +1,24 @@
 // Registry binding for the Portaldot V3 testnet.
 //
-// bind.js broadcasts binding transactions. Every input is revalidated by the
-// shared release preflight before the first transaction is signed, so direct
-// invocation is exactly as safe as the deploy step of the release:
+// bind.js broadcasts binding transactions. It is STAGE-AWARE: after the
+// deployment phase has already spent its funds, the binding stage budgets
+// only the REMAINING binding transactions (each call is re-estimated live
+// with eth_estimateGas at binding time), never the original whole-deployment
+// balance again. Every input is still revalidated before the first
+// transaction is signed, so direct invocation is exactly as safe as the
+// deploy stage of the release:
+// - the deployment record must exist, be structurally valid, and belong to
+//   this network, chain and identity; the deployed bytecode must be live,
 // - both native counterparts must be explicitly configured and must exist
 //   (Option::Some) on the native runtime,
-// - the funding thresholds must be met on both ledgers,
-// - the deployment record must be structurally valid,
+// - the remaining-binding funding threshold must be met on both ledgers,
 // - an already-bound token is compared against the intended configuration
 //   and the run ABORTS on any mismatch - "already bound" is never copied
-//   into success,
-// - every new binding's configuration and receipt evidence is persisted to
-//   the deployment record in the documented format.
+//   into success, and a recorded completed binding whose record write
+//   failed is reconciled by an upsert on rerun (no new transaction),
+// - pending binding entries are reconciled from the chain receipt; every
+//   new binding's configuration and receipt evidence is persisted to the
+//   deployment record atomically, immediately after it is sent.
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -23,14 +30,15 @@ const {
   CHAIN_ID,
   MAX_CODE_SIZE_BYTES,
   compareBinding,
-  parseRequiredTpot,
+  parseFeeMarginPercent,
   validateDeploymentRecord,
   validateNativeId,
   validateEvmAddress,
   validateReceipt,
 } = require('./lib/validation.cjs');
-const { runReleasePreflight } = require('./lib/preflight.cjs');
+const { runPreflight } = require('./lib/preflight.cjs');
 const { buildLiveProbes } = require('./lib/probes.cjs');
+const { readJsonRecord, writeJsonAtomic, archiveRecord } = require('./lib/persistence.cjs');
 const { loadSharedMapping } = require('./lib/shared-loader.cjs');
 
 const root = path.resolve(__dirname, '..');
@@ -59,9 +67,17 @@ function resolveCommitmentIdentity({ env, deploymentDeployer }) {
   return validateEvmAddress(deploymentDeployer, 'deployment record deployer');
 }
 
-// Builds the preflight configuration for the binding run. Pure with respect
-// to network state; exported so tests can exercise the strict-input rules.
-async function buildPreflightConfig({ env, signerAddress, deploymentDeployer }) {
+// Builds the bind-mode preflight configuration. Pure with respect to network
+// state; exported so tests can exercise the strict-input rules.
+async function buildPreflightConfig({
+  env,
+  signerAddress,
+  deploymentDeployer,
+  record,
+  networkName,
+  registryAddress,
+  tokenAddresses,
+}) {
   if (!env) {
     throw new Error('environment variables are required');
   }
@@ -92,12 +108,22 @@ async function buildPreflightConfig({ env, signerAddress, deploymentDeployer }) 
   }
 
   return {
+    mode: 'bind',
     expectedChainId: CHAIN_ID,
+    // The signer executes the bind transactions and its balance must cover
+    // the remaining-binding cost.
     deployerEvm: validateEvmAddress(signerAddress, 'signer EVM address'),
+    // The identity the record belongs to; the preflight verifies they match.
+    identityEvm,
     nativeAccount: { hex: account.hex, ss58: account.ss58 },
     nativeAccountHash,
     commitmentSource,
-    requiredTpot: parseRequiredTpot(env.POT_REQUIRED_TPOT),
+    networkName,
+    record,
+    registryAddress,
+    tokenAddresses,
+    // Bound in runBinding once the outstanding set is known.
+    outstandingCalls: [],
     nativeObjects: [
       { kind: 'asset', id: validateNativeId(assetIdRaw, 'POT_NATIVE_ASSET_ID') },
       { kind: 'nft_collection', id: validateNativeId(nftIdRaw, 'POT_NATIVE_NFT_ID') },
@@ -106,6 +132,7 @@ async function buildPreflightConfig({ env, signerAddress, deploymentDeployer }) 
     artifacts: [
       { name: 'PotRegistry', file: path.join(root, 'artifacts', 'contracts', 'PotRegistry.sol', 'PotRegistry.json'), maxSizeBytes: MAX_CODE_SIZE_BYTES },
     ],
+    feeMarginPercent: parseFeeMarginPercent(env.POT_RELEASE_FEE_MARGIN_PCT),
     gasLimitRaw: null,
   };
 }
@@ -146,60 +173,129 @@ function upsertBinding(deployments, entry) {
   }
 }
 
-async function main() {
-  const hre = require('hardhat');
-  const networkName = hre.network.name;
-  const [signer] = await hre.ethers.getSigners();
-  if (!signer) {
-    throw new Error('no signer available - set PORTALDOT_DEPLOYER_PRIVATE_KEY or configure the network accounts');
-  }
-  const wsUrl = process.env.PORTALDOT_WS_URL || 'wss://test-node-v3.portaldot.dev';
-
-  const deploymentsFile = path.join(root, 'deployments', `${networkName}.json`);
-  if (!fs.existsSync(deploymentsFile)) {
-    throw new Error(`deployment file not found: ${deploymentsFile}`);
-  }
-  let deployments;
-  try {
-    deployments = JSON.parse(fs.readFileSync(deploymentsFile, 'utf8'));
-  } catch (error) {
+// Reconciles a PENDING binding entry from the chain receipt (crash after
+// send). Ambiguous outcomes abort fail-closed.
+async function reconcilePendingBinding(entry, probes) {
+  const receipt = await probes.receipt(entry.txHash);
+  if (receipt === null || receipt === undefined) {
     throw new Error(
-      `deployment file is malformed (${deploymentsFile}): ${error.message}. Fix or replace the file; binding refuses to run against an unreadable record.`
+      `cannot reconcile the pending binding for ${entry.token}: transaction ${entry.txHash} has no receipt yet. Its outcome is ambiguous, so the binding stage fails closed instead of sending a duplicate transaction. Rerun once the transaction is mined.`
     );
   }
-  try {
-    validateDeploymentRecord(deployments);
-  } catch (error) {
-    throw new Error(`deployment file is not a valid release record (${deploymentsFile}): ${error.message}`);
-  }
-
-  const registryArtifact = requireRegistryArtifact();
-  const registry = new hre.ethers.Contract(
-    validateEvmAddress(deployments.contracts.PotRegistry.address, 'PotRegistry address'),
-    registryArtifact.abi,
-    signer
-  );
-  const tokenAddresses = {
-    erc20: validateEvmAddress(deployments.tokens.erc20.address, 'ERC-20 token address'),
-    erc721: validateEvmAddress(deployments.tokens.erc721.address, 'ERC-721 token address'),
+  validateReceipt(entry.txHash, receipt);
+  return {
+    ...entry,
+    blockNumber: Number(receipt.blockNumber),
+    status: 'confirmed',
   };
+}
 
-  // --- Full preflight revalidation; no binding transaction is signed yet ---
-  const config = await buildPreflightConfig({
-    env: process.env,
-    signerAddress: signer.address,
-    deploymentDeployer: deployments.deployer,
-  });
-  const probes = buildLiveProbes({ provider: hre.ethers.provider, wsUrl, from: signer.address });
-  const preflight = await runReleasePreflight(config, probes);
-  process.stdout.write(`${JSON.stringify(preflight.checks, null, 2)}\n`);
-  if (!preflight.ok) {
-    throw new Error(
-      `binding preflight failed: ${preflight.failures.join('; ')}. No binding transaction was signed.`
-    );
+// The dependency-injected binding orchestration. All side effects enter
+// through injected functions, so tests can run the actual flow offline:
+// - recordIo / probes as in runRelease;
+// - registryViews: read-only registry queries (isBound, bindingOfToken,
+//   bindingCount);
+// - bindSender(params, {gasLimit, onSent}) executes one real bind
+//   transaction; onSent fires after the transaction is on its way;
+// - encodeBind(params) encodes the registry call for the live re-estimate.
+async function runBinding({
+  env,
+  recordIo,
+  probes,
+  recordFile,
+  networkName,
+  chainId,
+  signerAddress,
+  registryViews,
+  bindSender,
+  encodeBind,
+  registryAddress,
+  tokenAddresses,
+  stdout = process.stdout,
+  stderr = process.stderr,
+}) {
+  if (!env) throw new Error('environment variables are required');
+  for (const [name, value] of Object.entries({ recordIo, probes, recordFile, networkName, chainId, signerAddress, registryViews, bindSender, encodeBind })) {
+    if (value === undefined) throw new Error(`runBinding: ${name} is required`);
   }
 
-  const calls = [
+  // 1. The record must exist and be strictly valid. Binding never creates
+  //    or overwrites a record from nothing.
+  const loaded = recordIo.read(recordFile);
+  if (loaded.status === 'missing') {
+    throw new Error(
+      'deployment record not found: ' + recordFile + '. Binding never releases into a void: run the deployment phase first (npm run deploy:testnet).'
+    );
+  }
+  if (loaded.status === 'malformed') {
+    throw new Error(
+      `deployment file is malformed (${recordFile}): ${loaded.error}. Fix or replace the file; binding refuses to run against an unreadable record.`
+    );
+  }
+  let record;
+  try {
+    record = validateDeploymentRecord(loaded.data);
+  } catch (error) {
+    throw new Error(`deployment file is not a valid release record (${recordFile}): ${error.message}`);
+  }
+
+  // 2. Record/network identity: binding never operates against a record
+  //    from another release.
+  if (record.network !== networkName) {
+    throw new Error(`deployment record network mismatch: the record says ${record.network}, the connected network is ${networkName}`);
+  }
+  if (Number(record.chainId) !== Number(chainId)) {
+    throw new Error(`deployment record chainId mismatch: the record says ${record.chainId}, the connected chain is ${chainId}`);
+  }
+
+  const config = await buildPreflightConfig({
+    env,
+    signerAddress,
+    deploymentDeployer: record.deployer,
+    record,
+    networkName,
+    registryAddress,
+    tokenAddresses,
+  });
+
+  // 3. Required confirmed entries. A partial record must never be signed
+  //    against: the registry and both tokens need live confirmed evidence.
+  const registryEntry = record.contracts.PotRegistry;
+  if (!registryEntry || registryEntry.status !== 'confirmed' || typeof registryEntry.address !== 'string') {
+    throw new Error(
+      'the deployment record has no confirmed PotRegistry entry. The deployment phase must complete (or be resumed) before binding; a partial record is never signed against.'
+    );
+  }
+  const recordedRegistry = validateEvmAddress(registryEntry.address, 'PotRegistry address');
+  if (registryAddress !== undefined && validateEvmAddress(registryAddress, 'registry address') !== recordedRegistry) {
+    throw new Error('the provided registry address does not match the deployment record; refusing to bind against an unexpected contract');
+  }
+  const tokenEntries = {};
+  for (const key of ['erc20', 'erc721']) {
+    const token = record.tokens[key];
+    if (!token || typeof token.address !== 'string') {
+      throw new Error(
+        `the deployment record is missing the ${key} token entry; the deployment phase did not complete on the named network. Binding never proceeds on a partial record.`
+      );
+    }
+    tokenEntries[key] = validateEvmAddress(token.address, `${key} token address`);
+  }
+  for (const [name, key] of [['PotERC20', 'erc20'], ['PotERC721', 'erc721']]) {
+    const contractEntry = record.contracts[name];
+    if (
+      !contractEntry ||
+      contractEntry.status !== 'confirmed' ||
+      String(contractEntry.address).toLowerCase() !== String(tokenEntries[key]).toLowerCase()
+    ) {
+      throw new Error(
+        `the deployment record is internally inconsistent: ${name} and tokens.${key} disagree. Fix the record deliberately; binding refuses mixed evidence.`
+      );
+    }
+  }
+
+  // 4. Intended binding calls: exactly two, token-kinds pinned in code.
+  //    The native ids come ONLY from the explicitly configured environment.
+  const intendedCalls = [
     {
       tokens: 'erc20',
       tokenKind: KIND_ERC20,
@@ -220,8 +316,27 @@ async function main() {
     },
   ];
 
-  for (const call of calls) {
-    const token = tokenAddresses[call.tokens];
+  // 5. Reconcile any pending binding entries from chain evidence BEFORE
+  //    classifying bound/outstanding, so a completed-but-unrecorded binding
+  //    is recovered instead of duplicated.
+  let pendingReconciled = 0;
+  for (const entry of record.bindings) {
+    if (entry && entry.status === 'pending') {
+      const confirmedEntry = await reconcilePendingBinding(entry, probes);
+      upsertBinding(record, confirmedEntry);
+      pendingReconciled += 1;
+      stderr.write(`\nbinding for ${entry.token}: reconciled from chain receipt ${entry.txHash} (no new transaction)\n`);
+    }
+  }
+
+  // 6. Classify each intended binding. Already-bound tokens are compared
+  //    field-by-field against the intended configuration; any mismatch
+  //    aborts BEFORE any transaction is signed. Read-only registry queries
+  //    failing is a fail-closed abort too.
+  const verified = [];
+  const outstanding = [];
+  for (const call of intendedCalls) {
+    const token = tokenEntries[call.tokens];
     const expected = {
       token,
       tokenKind: call.tokenKind,
@@ -234,57 +349,220 @@ async function main() {
       active: true,
     };
 
-    if (await registry.isBound(token)) {
-      const actual = await registry.bindingOfToken(token);
+    let bound;
+    try {
+      bound = await registryViews.isBound(token);
+    } catch (error) {
+      throw new Error(
+        `reading the on-chain binding state for ${call.label} (${token}) failed: ${error.message}. Fail-closed: distinguishing bound from unknown state is required before signing.`
+      );
+    }
+    if (bound) {
+      let actual;
+      try {
+        actual = await registryViews.bindingOfToken(token);
+      } catch (error) {
+        throw new Error(`reading the on-chain binding for ${call.label} (${token}) failed: ${error.message}`);
+      }
       const mismatches = compareBinding(expected, actual);
       if (mismatches.length > 0) {
-        process.stderr.write(`\nthe existing binding for ${token} does not match the intended configuration:\n`);
+        stderr.write(`\nthe existing binding for ${token} does not match the intended configuration:\n`);
+        stderr.write(`\nthe existing binding for ${token} does not match the intended configuration:\n`);
         for (const mismatch of mismatches) {
-          process.stderr.write(`  mismatch: ${mismatch}\n`);
+          stderr.write(`  mismatch: ${mismatch}\n`);
         }
         throw new Error(
           `aborting before any transaction: the on-chain binding for ${call.label} (${token}) does not match the requested configuration. If matching the existing binding was intended, bind with the values shown above instead of silently accepting the mismatch.`
         );
       }
-      process.stdout.write(`${call.label}: already bound and consistent with the intended configuration (${token} -> nativeId ${call.nativeId})\n`);
-      upsertBinding(deployments, expectedBindingEntry(expected));
-      writeDeploymentRecordSafe(deploymentsFile, deployments);
-      continue;
+      verified.push({ call, expected });
+      stdout.write(`${call.label}: already bound and consistent with the intended configuration (${token} -> nativeId ${call.nativeId})\n`);
+    } else {
+      // A confirmed binding entry for this token in the record while the
+      // chain reports the token unbound: the record and the chain disagree,
+      // and binding must never silently replace recorded evidence.
+      const recorded = (record.bindings || []).find(
+        (candidate) => candidate && candidate.token && String(candidate.token).toLowerCase() === token.toLowerCase()
+      );
+      if (recorded && recorded.status === 'confirmed') {
+        throw new Error(
+          `the record contains a confirmed binding for ${token} (tx ${recorded.txHash}) but the registry reports it unbound; the record and the chain disagree. Resolve the disagreement deliberately before binding (the record is never overwritten silently).`
+        );
+      }
+      outstanding.push({ call, expected });
     }
+  }
 
-    // --- Only here is a binding transaction signed ---
-    const tx = await registry.bind(
-      token,
+  // 7. Bind-mode preflight: record identity, bytecode, counterparts, and
+  //    the REMAINING-binding budget from live call re-estimates. No
+  //    transaction is signed here even if something fails.
+  const bindConfig = {
+    ...config,
+    outstandingCalls: outstanding.map(({ call, expected }) => ({
+      label: call.label,
+      token: expected.token,
+      to: recordedRegistry,
+      data: encodeBind(expected),
+    })),
+  };
+  const preflight = await runPreflight(bindConfig, probes);
+  stdout.write(`${JSON.stringify(preflight.checks, null, 2)}\n`);
+  if (!preflight.ok) {
+    throw new Error(
+      `binding preflight failed: ${preflight.failures.join('; ')}. No binding transaction was signed.`
+    );
+  }
+
+  // 8. Persist reconciled and pre-existing-verified evidence (atomic).
+  //    A binding already reconciled from a chain receipt (confirmed + txHash)
+  //    must not be downgraded to preExistingVerified.
+  for (const { expected } of verified) {
+    const existing = (record.bindings || []).find(
+      (candidate) => candidate && candidate.token && String(candidate.token).toLowerCase() === String(expected.token).toLowerCase()
+    );
+    if (existing && existing.status === 'confirmed' && existing.txHash) continue;
+    upsertBinding(record, expectedBindingEntry(expected));
+  }
+  if (pendingReconciled > 0 || verified.length > 0) {
+    record.updatedAt = new Date().toISOString();
+    recordIo.write(recordFile, record);
+  }
+
+  // 9. Execute only the outstanding bindings, each with its proven gas
+  //    ceiling, persisting pending immediately after send and confirmed
+  //    after a validated receipt.
+  const bindGasPlan = preflight.bindGasPlan || {};
+  let sentCount = 0;
+  for (const { call, expected } of outstanding) {
+    const gasLimit = bindGasPlan[call.label];
+    if (gasLimit === undefined) {
+      throw new Error(`no bind gas plan was produced for ${call.label}; refusing to sign a transaction without a proven ceiling`);
+    }
+    const params = [
+      expected.token,
       call.tokenKind,
       call.nativeKind,
       call.nativeId,
       call.nativeDecimals,
       call.evmDecimals,
-      config.nativeAccountHash
-    );
+      config.nativeAccountHash,
+    ];
+    sentCount += 1;
+    const tx = await bindSender(params, {
+      gasLimit,
+      onSent: (txHash) => {
+        const pendingEntry = { ...expectedBindingEntry(expected), txHash, status: 'pending' };
+        upsertBinding(record, pendingEntry);
+        record.updatedAt = new Date().toISOString();
+        recordIo.write(recordFile, record);
+      },
+    });
     const receipt = await tx.wait();
-    // Same validation the verifier applies: confirmed status plus hash match.
     validateReceipt(tx.hash, receipt);
     const entry = expectedBindingEntry({ ...expected, txHash: tx.hash, blockNumber: receipt.blockNumber });
-    upsertBinding(deployments, entry);
-    writeDeploymentRecordSafe(deploymentsFile, deployments);
-    process.stdout.write(
-      `${call.label}: bound ${token} -> nativeKind ${call.nativeKind}, nativeId ${call.nativeId}, conversionFactor ${entry.conversionFactor}, tx ${tx.hash}\n`
+    upsertBinding(record, entry);
+    record.updatedAt = new Date().toISOString();
+    recordIo.write(recordFile, record);
+    stdout.write(
+      `${call.label}: bound ${expected.token} -> nativeKind ${call.nativeKind}, nativeId ${call.nativeId}, conversionFactor ${entry.conversionFactor}, tx ${tx.hash}\n`
     );
   }
 
+  // 10. Registry count as the final read; a failure here is reported
+  //     fail-closed (bindings are already persisted, rerun reconciles).
   let bindingCount;
   try {
-    bindingCount = Number(await registry.bindingCount());
+    bindingCount = Number(await registryViews.bindingCount());
   } catch (error) {
     throw new Error(`reading the registry binding count failed: ${error.message}`);
   }
-  process.stdout.write(`\nregistry binding count ${bindingCount}\n`);
-  process.stdout.write('next: npm run verify:deployment\n');
+  stdout.write(`\nregistry binding count ${bindingCount}\n`);
+  stdout.write('next: npm run verify:deployment\n');
+  return { record, preflight, sentCount, verifiedCount: verified.length, reconciledCount: pendingReconciled };
 }
 
-function writeDeploymentRecordSafe(deploymentsFile, deployments) {
-  fs.writeFileSync(deploymentsFile, `${JSON.stringify(deployments, null, 2)}\n`);
+async function main() {
+  const hre = require('hardhat');
+  const networkName = hre.network.name;
+  const [signer] = await hre.ethers.getSigners();
+  if (!signer) {
+    throw new Error('no signer available - set PORTALDOT_DEPLOYER_PRIVATE_KEY or configure the network accounts');
+  }
+  const wsUrl = process.env.PORTALDOT_WS_URL || 'wss://test-node-v3.portaldot.dev';
+
+  // Read-only pre-scan so the registry contract can be wired from the
+  // recorded evidence before the injected flow takes over.
+  const recordFile = path.join(root, 'deployments', `${networkName}.json`);
+  const initial = readJsonRecord(recordFile);
+  if (initial.status === 'missing') {
+    throw new Error(`deployment file not found: ${recordFile}. Run the deployment phase first.`);
+  }
+  if (initial.status === 'malformed') {
+    throw new Error(
+      `deployment file is malformed (${recordFile}): ${initial.error}. Fix or replace the file; binding refuses to run against an unreadable record.`
+    );
+  }
+  let record;
+  try {
+    record = validateDeploymentRecord(initial.data);
+  } catch (error) {
+    throw new Error(`deployment file is not a valid release record (${recordFile}): ${error.message}`);
+  }
+  const registryEntry = record.contracts.PotRegistry;
+  if (!registryEntry || typeof registryEntry.address !== 'string') {
+    throw new Error('the deployment record has no PotRegistry entry; run the deployment phase first.');
+  }
+  const registryAddress = validateEvmAddress(registryEntry.address, 'PotRegistry address');
+
+  const registry = new hre.ethers.Contract(registryAddress, requireRegistryArtifact().abi, signer);
+  const tokenAddresses = {};
+  for (const key of ['erc20', 'erc721']) {
+    const token = record.tokens ? record.tokens[key] : null;
+    if (!token || typeof token.address !== 'string') {
+      throw new Error(
+        `the deployment record is missing the ${key} token entry; the deployment phase did not complete on the named network. Binding never proceeds on a partial record.`
+      );
+    }
+    tokenAddresses[key] = validateEvmAddress(token.address, `${key} token address`);
+  }
+  const registryViews = {
+    isBound: (token) => registry.isBound(token),
+    bindingOfToken: (token) => registry.bindingOfToken(token),
+    bindingCount: () => registry.bindingCount(),
+  };
+  const bindSender = async (params, { gasLimit, onSent } = {}) => {
+    const tx = await registry.bind(...params, { gasLimit });
+    if (onSent) onSent(tx.hash);
+    return tx;
+  };
+  const encodeBind = (params) =>
+    registry.interface.encodeFunctionData('bind', [
+      params.token,
+      BigInt(params.tokenKind),
+      BigInt(params.nativeKind),
+      BigInt(params.nativeId),
+      BigInt(params.nativeDecimals),
+      BigInt(params.evmDecimals),
+      params.nativeAccountHash,
+    ]);
+
+  await runBinding({
+    env: process.env,
+    recordIo: { read: readJsonRecord, write: writeJsonAtomic, archive: archiveRecord },
+    probes: buildLiveProbes({ provider: hre.ethers.provider, wsUrl, from: signer.address }),
+    recordFile,
+    networkName,
+    chainId: Number((await hre.ethers.provider.getNetwork()).chainId),
+    signerAddress: signer.address,
+    registryViews,
+    bindSender,
+    encodeBind,
+    registryAddress,
+    tokenAddresses: {
+      erc20: tokenAddresses.erc20,
+      erc721: tokenAddresses.erc721,
+    },
+  });
 }
 
 if (require.main === module) {
@@ -294,4 +572,10 @@ if (require.main === module) {
   });
 }
 
-module.exports = { buildPreflightConfig, expectedBindingEntry, upsertBinding, resolveCommitmentIdentity };
+module.exports = {
+  buildPreflightConfig,
+  runBinding,
+  expectedBindingEntry,
+  upsertBinding,
+  resolveCommitmentIdentity,
+};

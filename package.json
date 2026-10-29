@@ -12,7 +12,7 @@
     "abi": "node scripts/generate-abi.js",
     "test": "hardhat test",
     "test:sdk": "node --test sdk/test/portaldot.test.mjs",
-    "test:release": "node --test scripts/test/bind.test.mjs scripts/test/check-funding.test.mjs scripts/test/deploy.test.mjs scripts/test/preflight.test.mjs scripts/test/validation.test.mjs scripts/test/verify-deployment.test.mjs",
+    "test:release": "node --test scripts/test/bind.test.mjs scripts/test/check-funding.test.mjs scripts/test/deploy.test.mjs scripts/test/lifecycle.test.mjs scripts/test/preflight.test.mjs scripts/test/validation.test.mjs scripts/test/verify-deployment.test.mjs",
     "preflight": "node scripts/preflight.js",
     "deploy:testnet": "hardhat run scripts/deploy.js --network portaldotTestnet",
     "init:deployer": "node scripts/init-deployer.js",

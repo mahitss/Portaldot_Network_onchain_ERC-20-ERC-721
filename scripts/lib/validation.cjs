@@ -11,6 +11,13 @@ const MAX_UINT256 = (1n << 256n) - 1n;
 const MAX_UINT32 = (1n << 32n) - 1n;
 const MAX_CODE_SIZE_BYTES = 10240;
 const DEFAULT_REQUIRED_TPOT = 1350n;
+// Documented default fee-fluctuation margin for the whole-release budget.
+// Observed base-fee swing on the live testnet was roughly +19%; 20% is the
+// default safety margin applied on top of measured gas x gas price costs.
+const DEFAULT_FEE_MARGIN_PERCENT = 20;
+// One native unit is 10^-14 tPOT, one EVM wei is 10^-18 of the same token:
+// 1 native unit = 10^(18-14) = 10^4 wei.
+const WEI_PER_NATIVE_UNIT = 10n ** 4n;
 
 // PotRegistry enums (contracts/PotRegistry.sol)
 const KIND_ERC20 = 0;
@@ -32,6 +39,36 @@ function parseRequiredTpot(value) {
     );
   }
   return BigInt(trimmed);
+}
+
+// Strict POT_RELEASE_FEE_MARGIN_PCT parsing: an integer percentage in [0, 100].
+// It is the documented margin applied on top of the measured budget subtotal.
+function parseFeeMarginPercent(value) {
+  if (value === undefined || value === '') {
+    return DEFAULT_FEE_MARGIN_PERCENT;
+  }
+  const trimmed = String(value).trim();
+  if (!/^\d+$/.test(trimmed)) {
+    throw new Error(
+      `invalid POT_RELEASE_FEE_MARGIN_PCT: "${value}" of type ${typeof value}. Must be a whole integer percentage between 0 and 100 in decimal notation.`
+    );
+  }
+  const parsed = Number(trimmed);
+  if (parsed > 100) {
+    throw new Error(`invalid POT_RELEASE_FEE_MARGIN_PCT: "${value}". The margin must be an integer percentage between 0 and 100.`);
+  }
+  return parsed;
+}
+
+// Exact BigInteger ceiling division (b >= 1). Never uses JavaScript numbers.
+function ceilDiv(a, b) {
+  const divisor = BigInt(b);
+  if (divisor <= 0n) {
+    throw new Error('ceilDiv requires a positive divisor');
+  }
+  const value = BigInt(a);
+  const quotient = value / divisor;
+  return quotient * divisor === value ? quotient : quotient + 1n;
 }
 
 function tpotToNativeUnits(amountTpot) {
@@ -265,6 +302,10 @@ function normalizeBindingValue(field, value) {
 function compareBinding(expected, actual) {
   const mismatches = [];
   for (const field of BINDING_FIELDS) {
+    if (actual[field] === undefined) {
+      mismatches.push(`${field}: expected ${String(normalizeBindingValue(field, expected[field]))}, on-chain missing`);
+      continue;
+    }
     const a = normalizeBindingValue(field, expected[field]);
     const b = normalizeBindingValue(field, actual[field]);
     if (a !== b) {
@@ -313,8 +354,132 @@ function assessFunding({
   };
 }
 
+// Stage-aware whole-release budget. Replaces the fixed-threshold funding
+// check for the deploy stage: the requirement is the sum of every remaining
+// transaction's measured estimate x the live gas price, plus a documented
+// fee-fluctuation margin, converted exactly into each ledger's own units.
+//
+// - requiredTpotFloor: manual minimum (POT_REQUIRED_TPOT) applied in deploy
+//   mode only: max(computed requirement, floor). In bind mode the caller
+//   passes 0n so only the remaining transactions are required.
+// - all balances/costs are BigInt in the ledger's own base units (wei for
+//   EVM 18 decimals, native units for 14 decimals).
+function assessReleaseBudget({
+  creationEstimatesGas = [],
+  bindingEstimateGas = 0n,
+  outstandingBindings = 0,
+  gasPriceWei,
+  feeMarginPercent = DEFAULT_FEE_MARGIN_PERCENT,
+  evmBalanceWei = null,
+  nativeFreeUnits = null,
+  evmReadError = null,
+  nativeReadError = null,
+  requiredTpotFloor = 0n,
+}) {
+  if (typeof gasPriceWei !== 'bigint' || gasPriceWei < 0n) {
+    throw new Error('gasPriceWei must be a non-negative bigint');
+  }
+  const estimates = creationEstimatesGas.map((value, index) => {
+    if (typeof value !== 'bigint' || value < 0n) {
+      throw new Error(`creationEstimatesGas[${index}] must be a non-negative bigint, got ${typeof value}`);
+    }
+    return value;
+  });
+  if (typeof bindingEstimateGas !== 'bigint' || bindingEstimateGas < 0n) {
+    throw new Error('bindingEstimateGas must be a non-negative bigint');
+  }
+  if (!Number.isSafeInteger(outstandingBindings) || outstandingBindings < 0) {
+    throw new Error('outstandingBindings must be a non-negative integer');
+  }
+  if (!Number.isSafeInteger(feeMarginPercent) || feeMarginPercent < 0 || feeMarginPercent > 100) {
+    throw new Error('feeMarginPercent must be an integer between 0 and 100');
+  }
+  const floor = BigInt(requiredTpotFloor);
+  if (floor < 0n) {
+    throw new Error('requiredTpotFloor must be non-negative');
+  }
+
+  const deploymentGas = estimates.reduce((total, value) => total + value, 0n);
+  const deploymentBudgetWei = deploymentGas * gasPriceWei;
+  const bindingBudgetWei = bindingEstimateGas * BigInt(outstandingBindings) * gasPriceWei;
+  const subtotalWei = deploymentBudgetWei + bindingBudgetWei;
+  const marginWei = ceilDiv(subtotalWei * BigInt(feeMarginPercent), 100n);
+  let requiredEvmWei = subtotalWei + marginWei;
+  let floorApplied = false;
+  if (floor * 10n ** BigInt(EVM_DECIMALS) > requiredEvmWei) {
+    requiredEvmWei = floor * 10n ** BigInt(EVM_DECIMALS);
+    floorApplied = true;
+  }
+  // Exact conversion into native units: both thresholds describe the same
+  // tPOT amount, the native one rounded up to its own (finer) granularity.
+  const requiredNativeUnits = ceilDiv(requiredEvmWei, WEI_PER_NATIVE_UNIT);
+
+  // Balances are optional for budget-only consumers (e.g. the estimate
+  // report); a missing balance with no declared read error is treated as a
+  // failed read, so `funded` can never be claimed without ledger evidence.
+  let evmEvidenceError = evmReadError;
+  let nativeEvidenceError = nativeReadError;
+  if (evmEvidenceError === null) {
+    if (evmBalanceWei === null) {
+      evmEvidenceError = 'no EVM balance evidence provided';
+    } else if (typeof evmBalanceWei !== 'bigint') {
+      throw new Error(`evmBalanceWei must be a bigint, got ${typeof evmBalanceWei}`);
+    }
+  } else if (typeof evmBalanceWei === 'bigint') {
+    throw new Error('evmBalanceWei and evmReadError are mutually exclusive');
+  }
+  if (nativeEvidenceError === null) {
+    if (nativeFreeUnits === null) {
+      nativeEvidenceError = 'no native balance evidence provided';
+    } else if (typeof nativeFreeUnits !== 'bigint') {
+      throw new Error(`nativeFreeUnits must be a bigint, got ${typeof nativeFreeUnits}`);
+    }
+  } else if (typeof nativeFreeUnits === 'bigint') {
+    throw new Error('nativeFreeUnits and nativeReadError are mutually exclusive');
+  }
+
+  const evmShortfallWei = evmEvidenceError === null && evmBalanceWei < requiredEvmWei
+    ? requiredEvmWei - evmBalanceWei
+    : 0n;
+  const nativeShortfallUnits = nativeEvidenceError === null && nativeFreeUnits < requiredNativeUnits
+    ? requiredNativeUnits - nativeFreeUnits
+    : 0n;
+
+  const evmFunded = evmEvidenceError === null && evmShortfallWei === 0n;
+  const nativeFunded = nativeEvidenceError === null && nativeShortfallUnits === 0n;
+  return {
+    deploymentGas,
+    deploymentBudgetWei,
+    bindingEstimateGas,
+    bindingCount: BigInt(outstandingBindings),
+    bindingBudgetWei,
+    subtotalWei,
+    feeMarginPercent,
+    marginWei,
+    requiredEvmWei,
+    requiredNativeUnits,
+    requiredTpotFloor: floor,
+    floorApplied,
+    funded: evmFunded && nativeFunded,
+    evmFunded,
+    nativeFunded,
+    evmShortfallWei,
+    nativeShortfallUnits,
+  };
+}
+
 // Fail-closed structural validation of a deployment record. Throws on any
 // malformed field so callers can distinguish "no file" from "bad file".
+//
+// Entries are structurally valid in exactly two shapes:
+// - status 'pending': txHash is required (the record is written immediately
+//   after the transaction is sent), address is optional (it becomes known
+//   only when the receipt is mined) and blockNumber is absent.
+// - status 'confirmed' (also the implicit legacy default when the status
+//   field is absent): address and txHash are required.
+// Completeness (all three required contracts) is NOT asserted here: a
+// partially completed release is a valid resumable record, not a malformed
+// one. Callers that need a complete release check that separately.
 function validateDeploymentRecord(data) {
   if (data === null || typeof data !== 'object' || Array.isArray(data)) {
     throw new Error(`deployment record is not an object (${data === null ? 'null' : typeof data})`);
@@ -332,10 +497,7 @@ function validateDeploymentRecord(data) {
     throw new Error('deployment record has no contracts table');
   }
   for (const [name, entry] of Object.entries(data.contracts)) {
-    if (entry === null || typeof entry !== 'object') {
-      throw new Error(`deployment record contract entry ${name} is not an object`);
-    }
-    validateEvmAddress(entry.address, `deployment record ${name}.address`);
+    entryStatus(entry, name);
     if (typeof entry.txHash !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(entry.txHash)) {
       throw new Error(`deployment record ${name}.txHash is not a 32-byte transaction hash: ${entry.txHash}`);
     }
@@ -353,6 +515,31 @@ function validateDeploymentRecord(data) {
     throw new Error('deployment record bindings is not an array');
   }
   return data;
+}
+
+// Resolves a contract entry's status with legacy compatibility: records
+// written before per-transaction persistence had no status field and were
+// always fully confirmed. Also validates the entry's address/blockNumber
+// shape according to that status.
+function entryStatus(entry, name) {
+  if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+    throw new Error(`deployment record contract entry ${name} is not an object`);
+  }
+  const status = entry.status === undefined ? 'confirmed' : entry.status;
+  if (status !== 'pending' && status !== 'confirmed') {
+    throw new Error(`deployment record contract entry ${name} has an invalid status: ${JSON.stringify(status)}. Expected "pending" or "confirmed".`);
+  }
+  if (typeof entry.address !== 'string') {
+    if (status !== 'pending') {
+      throw new Error(`deployment record ${name}.address is required for a ${status} entry, got ${typeof entry.address}`);
+    }
+  } else {
+    validateEvmAddress(entry.address, `deployment record ${name}.address`);
+  }
+  if (entry.blockNumber !== undefined && (!Number.isSafeInteger(entry.blockNumber) || entry.blockNumber < 0)) {
+    throw new Error(`deployment record ${name}.blockNumber is not a non-negative safe integer: ${JSON.stringify(entry.blockNumber)}`);
+  }
+  return status;
 }
 
 // Structural validation of one expected binding entry (the intentional,
@@ -388,6 +575,10 @@ module.exports = {
   NATIVE_NFTS,
   REQUIRED_CONTRACT_NAMES,
   parseRequiredTpot,
+  parseFeeMarginPercent,
+  DEFAULT_FEE_MARGIN_PERCENT,
+  WEI_PER_NATIVE_UNIT,
+  ceilDiv,
   tpotToNativeUnits,
   tpotToEvmUnits,
   tpotToUnits,
@@ -404,6 +595,7 @@ module.exports = {
   BINDING_FIELDS,
   normalizeBindingValue,
   assessFunding,
+  assessReleaseBudget,
   validateDeploymentRecord,
   validateBindingEntry,
 };

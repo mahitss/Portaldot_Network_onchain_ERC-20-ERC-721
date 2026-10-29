@@ -114,6 +114,12 @@ test('buildPreflightConfig builds a dual-ledger config with defaults', async () 
   assert.equal(config.requireDualCounterparts, true);
   assert.equal(config.gasLimitRaw, null);
   assert.equal(config.artifacts.length, 3);
+  // stage-aware budget configuration
+  assert.equal(config.mode, 'deploy');
+  assert.equal(config.feeMarginPercent, 20);
+  assert.equal(config.bindingReserveCount, 2);
+  assert.equal(config.bindingReserveArtifact.name, 'PotRegistry');
+  assert.equal(config.outstandingArtifacts.length, 3);
 });
 
 test('buildPreflightConfig requires BOTH native counterparts explicitly', async () => {
@@ -144,6 +150,20 @@ test('buildPreflightConfig rejects malformed native ids and threshold overrides'
     () => buildPreflightConfig({ env: { ...baseEnv(), POT_REQUIRED_TPOT: '1.5' }, deployerAddress: DEPLOYER_EVM }),
     /invalid POT_REQUIRED_TPOT/
   );
+  await assert.rejects(
+    () => buildPreflightConfig({ env: { ...baseEnv(), POT_RELEASE_FEE_MARGIN_PCT: '-5' }, deployerAddress: DEPLOYER_EVM }),
+    /invalid POT_RELEASE_FEE_MARGIN_PCT/
+  );
+  await assert.rejects(
+    () => buildPreflightConfig({ env: { ...baseEnv(), POT_RELEASE_FEE_MARGIN_PCT: '150' }, deployerAddress: DEPLOYER_EVM }),
+    /invalid POT_RELEASE_FEE_MARGIN_PCT/
+  );
+  const configured = await buildPreflightConfig({
+    env: { ...baseEnv(), POT_RELEASE_FEE_MARGIN_PCT: '35', POT_REQUIRED_TPOT: '2000' },
+    deployerAddress: DEPLOYER_EVM,
+  });
+  assert.equal(configured.feeMarginPercent, 35);
+  assert.equal(configured.requiredTpot, 2000n);
 });
 
 test('buildPreflightConfig accepts an explicit commitment override', async () => {

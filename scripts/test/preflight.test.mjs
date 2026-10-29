@@ -5,7 +5,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { runReleasePreflight } from '../lib/preflight.cjs';
+import { runReleasePreflight, DEFAULT_GAS_MARGIN_PERCENT } from '../lib/preflight.cjs';
+import { assessReleaseBudget, ceilDiv, WEI_PER_NATIVE_UNIT } from '../lib/validation.cjs';
 
 const testRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const DEPLOYER_EVM = '0xf7eC65d11e35375A250e474059a917B537804142';
@@ -16,6 +17,8 @@ const TPOT_EVM = 1350n * 10n ** 18n;
 const TPOT_NATIVE = 1350n * 10n ** 14n;
 const BLOCK_LIMIT = 18446744073709551615n;
 const ESTIMATE = 1_000_000_000_000_000n;
+const BIND_ESTIMATE = 17_000_000_000_000_000n;
+const GAS_PRICE = 27_440n;
 
 function passingConfig(overrides = {}) {
   return {
@@ -46,9 +49,13 @@ function passingProbes(record = [], overrides = {}) {
     chainId: wrap('chainId', async () => 420420777n),
     evmBalance: wrap('evmBalance', async () => TPOT_EVM),
     nativeFreeBalance: wrap('nativeFreeBalance', async () => TPOT_NATIVE),
+    gasPrice: wrap('gasPrice', async () => 27_440n),
     nativeObject: wrap('nativeObject', async (kind, id) => ({ kind, id, exists: true, details: 'fake object' })),
     blockGasLimit: wrap('blockGasLimit', async () => BLOCK_LIMIT),
     estimateCreationGas: wrap('estimateCreationGas', async () => ESTIMATE),
+    code: wrap('code', async (address) => `0x5b${'ff'.repeat(100)}`),
+    receipt: wrap('receipt', async (txHash) => ({ status: 1, transactionHash: txHash, blockNumber: 1, contractAddress: '0x' + 'ab'.repeat(20) })),
+    estimateCall: wrap('estimateCall', async ({ to, data, from }) => BIND_ESTIMATE),
     ...overrides,
   };
 }
@@ -339,4 +346,301 @@ test('empty token configuration is rejected', async () => {
   );
   assert.equal(result.ok, false);
   assert.ok(result.failures.includes('token configuration'));
+});
+
+// --- Deploy mode: the computed whole-release budget ---
+
+const WHOLE_RELEASE_ESTIMATES = {
+  PotERC20: 10_589_282_911_910_634n,
+  PotERC721: 16_865_512_345_550_202n,
+  PotRegistry: 16_656_979_668_562_858n,
+};
+
+function wholeReleaseProbes(record = [], overrides = {}) {
+  return passingProbes(record, {
+    estimateCreationGas: async (artifact) => {
+      const estimate = WHOLE_RELEASE_ESTIMATES[artifact.name];
+      if (estimate === undefined) throw new Error(`no estimated gas for ${artifact.name}`);
+      return estimate;
+    },
+    ...overrides,
+  });
+}
+
+async function writeArtifacts() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'preflight-budget-'));
+  const artifacts = ['PotERC20', 'PotERC721', 'PotRegistry'].map((name) => {
+    const file = path.join(dir, `${name}.json`);
+    fs.writeFileSync(file, JSON.stringify({ deployedBytecode: '0x60016001', abi: [] }));
+    return { name, file, maxSizeBytes: 10240 };
+  });
+  return { dir, artifacts };
+}
+
+test('deploy mode with a zero floor computes the whole-release budget and passes at exactly sufficient funds', async () => {
+  const { dir, artifacts } = await writeArtifacts();
+  try {
+    const deploymentGas = WHOLE_RELEASE_ESTIMATES.PotERC20 + WHOLE_RELEASE_ESTIMATES.PotERC721 + WHOLE_RELEASE_ESTIMATES.PotRegistry;
+    const deploymentWei = deploymentGas * GAS_PRICE;
+    const bindingWei = WHOLE_RELEASE_ESTIMATES.PotRegistry * 2n * GAS_PRICE;
+    const subtotal = deploymentWei + bindingWei;
+    const required = subtotal + ceilDiv(subtotal * 20n, 100n);
+    const config = passingConfig({
+      requiredTpot: 0n, // no floor: the computed budget must dominate
+      artifacts,
+      outstandingArtifacts: artifacts,
+      bindingReserveCount: 2,
+      bindingReserveArtifact: artifacts[2],
+    });
+    const result = await runReleasePreflight(config, wholeReleaseProbes([], {
+      evmBalance: async () => required,
+      nativeFreeBalance: async () => ceilDiv(required, WEI_PER_NATIVE_UNIT),
+    }));
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.failures, []);
+    const budgetRow = result.checks.find((check) => check.name === 'release budget (whole release)');
+    assert.equal(budgetRow.pass, true);
+    assert.match(budgetRow.detail, /binding reserve 2 x/);
+    assert.match(budgetRow.detail, /\+20% margin/);
+    assert.equal(result.budget.requiredEvmWei, required);
+    assert.equal(result.budget.requiredNativeUnits, ceilDiv(required, WEI_PER_NATIVE_UNIT));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('deploy mode aborts one base unit below the computed whole-release requirement', async () => {
+  const { dir, artifacts } = await writeArtifacts();
+  try {
+    const deploymentGas = WHOLE_RELEASE_ESTIMATES.PotERC20 + WHOLE_RELEASE_ESTIMATES.PotERC721 + WHOLE_RELEASE_ESTIMATES.PotRegistry;
+    const deploymentWei = deploymentGas * GAS_PRICE;
+    const bindingWei = WHOLE_RELEASE_ESTIMATES.PotRegistry * 2n * GAS_PRICE;
+    const subtotal = deploymentWei + bindingWei;
+    const required = subtotal + ceilDiv(subtotal * 20n, 100n);
+    const config = passingConfig({
+      requiredTpot: 0n,
+      artifacts,
+      outstandingArtifacts: artifacts,
+      bindingReserveCount: 2,
+      bindingReserveArtifact: artifacts[2],
+    });
+    const result = await runReleasePreflight(config, wholeReleaseProbes([], {
+      evmBalance: async () => required - 1n,
+      nativeFreeBalance: async () => ceilDiv(required, WEI_PER_NATIVE_UNIT),
+    }));
+    assert.equal(result.ok, false);
+    const evmRow = result.checks.find((check) => check.name.startsWith('funding (EVM ledger'));
+    assert.match(evmRow.detail, /short 0\.000000000000000001 tPOT/);
+    const nativeRow = result.checks.find((check) => check.name.startsWith('funding (native ledger'));
+    assert.equal(nativeRow.pass, true);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the allowed floor raises the computed whole-release requirement', async () => {
+  const { dir, artifacts } = await writeArtifacts();
+  try {
+    const deploymentGas = WHOLE_RELEASE_ESTIMATES.PotERC20 + WHOLE_RELEASE_ESTIMATES.PotERC721 + WHOLE_RELEASE_ESTIMATES.PotRegistry;
+    const deploymentWei = deploymentGas * GAS_PRICE;
+    const bindingWei = WHOLE_RELEASE_ESTIMATES.PotRegistry * 2n * GAS_PRICE;
+    const subtotal = deploymentWei + bindingWei;
+    const required = subtotal + ceilDiv(subtotal * 20n, 100n);
+    const config = passingConfig({
+      requiredTpot: ceilDiv(required * 2n, 10n ** 18n), // a floor far above the computed budget
+      artifacts,
+      outstandingArtifacts: artifacts,
+      bindingReserveCount: 2,
+      bindingReserveArtifact: artifacts[2],
+    });
+    const result = await runReleasePreflight(config, wholeReleaseProbes([], {
+      evmBalance: async () => required, // would cover the computed budget only
+    }));
+    assert.equal(result.ok, false);
+    assert.equal(result.budget.floorApplied, true);
+    const evmRow = result.checks.find((check) => check.name.startsWith('funding (EVM ledger'));
+    assert.match(evmRow.detail, /short/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a failed gas-price read keeps the whole-release budget fail-closed without any funding row passing', async () => {
+  const result = await runReleasePreflight(passingConfig(), passingProbes([], {
+    gasPrice: async () => { throw new Error('the RPC provided no gas price (fee unavailable)'); },
+  }));
+  assert.equal(result.ok, false);
+  const budgetRow = result.checks.find((check) => check.name === 'release budget (whole release)');
+  assert.equal(budgetRow.pass, false);
+  assert.match(budgetRow.detail, /no gas price/);
+  assert.ok(result.failures.includes('funding (both ledgers)'));
+});
+
+test('a required binding reserve without an artifact to bound it is refused', async () => {
+  const { dir, artifacts } = await writeArtifacts();
+  try {
+    const config = passingConfig({
+      requiredTpot: 0n,
+      artifacts,
+      outstandingArtifacts: artifacts,
+      bindingReserveCount: 2,
+      bindingReserveArtifact: undefined,
+    });
+    const result = await runReleasePreflight(config, wholeReleaseProbes());
+    assert.equal(result.ok, false);
+    assert.match(
+      result.checks.find((check) => check.name === 'release budget (whole release)').detail,
+      /unbounded binding reserve/
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- Bind mode: the remaining-phase budget ---
+
+const REGISTRY_ADDR = `0x${'cd'.repeat(20)}`;
+const TOKEN_ERC20 = `0x${'11'.repeat(20)}`;
+const TOKEN_ERC721 = `0x${'22'.repeat(20)}`;
+
+function bindConfig(overrides = {}) {
+  const registryFile = overrides.registryFile;
+  return {
+    mode: 'bind',
+    expectedChainId: 420420777,
+    deployerEvm: DEPLOYER_EVM,
+    identityEvm: DEPLOYER_EVM,
+    nativeAccount: { hex: ACCOUNT_HEX, ss58: ACCOUNT_SS58 },
+    nativeAccountHash: COMMITMENT,
+    commitmentSource: 'derived',
+    networkName: 'portaldotTestnet',
+    record: { network: 'portaldotTestnet', chainId: 420420777, deployer: DEPLOYER_EVM, contracts: {}, tokens: {}, bindings: [] },
+    registryAddress: REGISTRY_ADDR,
+    tokenAddresses: { erc20: TOKEN_ERC20, erc721: TOKEN_ERC721 },
+    outstandingCalls: [
+      { label: 'erc20', token: TOKEN_ERC20, to: REGISTRY_ADDR, data: `0x${'dd'.repeat(32)}` },
+      { label: 'erc721', token: TOKEN_ERC721, to: REGISTRY_ADDR, data: `0x${'ee'.repeat(32)}` },
+    ],
+    nativeObjects: [
+      { kind: 'asset', id: 1 },
+      { kind: 'nft_collection', id: 2 },
+    ],
+    requireDualCounterparts: true,
+    artifacts: registryFile ? [{ name: 'PotRegistry', file: registryFile, maxSizeBytes: 10240 }] : [],
+    feeMarginPercent: 20,
+    gasLimitRaw: null,
+    registryFile: undefined,
+    ...overrides,
+  };
+}
+
+function bindProbes(record = [], overrides = {}) {
+  return passingProbes(record, {
+    // Deliberately modest balances: far below any whole-release requirement,
+    // yet sufficient for the outstanding binds. Binding must never demand
+    // the original deployment budget again.
+    evmBalance: async () => 500n * 10n ** 18n,
+    nativeFreeBalance: async () => 500n * 10n ** 14n,
+    estimateCall: async ({ to, data, from }) => BIND_ESTIMATE,
+    ...overrides,
+  });
+}
+
+test('bind mode budgets only the outstanding calls and accepts a balance far below the whole-release requirement', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'preflight-bind-'));
+  try {
+    const registryFile = path.join(dir, 'registry.json');
+    fs.writeFileSync(registryFile, JSON.stringify({ deployedBytecode: '0x60016001', abi: [] }));
+    const subtotal = 2n * BIND_ESTIMATE * GAS_PRICE;
+    const expectedRequired = subtotal + ceilDiv(subtotal * 20n, 100n);
+    // 2,000 tPOT: enough for the remaining bindings, far below the whole
+    // release (deployment + bindings + margin, ~2,549 tPOT measured).
+    const result = await runReleasePreflight(bindConfig({ registryFile }), bindProbes([], {
+      evmBalance: async () => 2_000n * 10n ** 18n,
+      nativeFreeBalance: async () => 2_000n * 10n ** 14n,
+    }));
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.failures, []);
+    assert.equal(result.budget.bindingBudgetWei, subtotal);
+    assert.equal(result.budget.requiredEvmWei, expectedRequired);
+    const budgetRow = result.checks.find((check) => check.name === 'binding budget (remaining phase)');
+    assert.match(budgetRow.detail, /2 outstanding bind call\(s\)/);
+    // per-call gas plans for both outstanding binds
+    assert.match(result.checks.find((check) => check.name === 'bind gas plan (erc20)').detail, /estimate 17000000000000000/);
+    assert.ok(result.bindGasPlan.erc20 === (BIND_ESTIMATE * 120n) / 100n);
+    assert.ok(result.bindGasPlan.erc721 === (BIND_ESTIMATE * 120n) / 100n);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('bind mode halves the requirement when only one binding is outstanding (resume scenario)', async () => {
+  const config = bindConfig({
+    outstandingCalls: [{ label: 'erc721', token: TOKEN_ERC721, to: REGISTRY_ADDR, data: `0x${'ee'.repeat(32)}` }],
+  });
+  const subtotal = BIND_ESTIMATE * GAS_PRICE;
+  const expectedRequired = subtotal + ceilDiv(subtotal * 20n, 100n);
+  // 600 tPOT would never cover the whole release but covers one binding.
+  const result = await runReleasePreflight(config, bindProbes([], {
+    evmBalance: async () => 600n * 10n ** 18n,
+    nativeFreeBalance: async () => 600n * 10n ** 14n,
+  }));
+  assert.equal(result.ok, true);
+  assert.equal(result.budget.bindingBudgetWei, subtotal);
+  assert.equal(result.budget.requiredEvmWei, expectedRequired);
+  assert.match(result.checks.find((check) => check.name === 'binding budget (remaining phase)').detail, /1 outstanding bind call\(s\)/);
+});
+
+test('bind mode fails closed when a bind-call estimate fails', async () => {
+  const result = await runReleasePreflight(bindConfig(), bindProbes([], {
+    estimateCall: async () => { throw new Error('eth_estimateGas failed for the call: simulation rejected'); },
+  }));
+  assert.equal(result.ok, false);
+  assert.ok(result.failures.includes('binding budget (remaining phase)'));
+  assert.ok(result.failures.includes('funding (both ledgers)'));
+});
+
+test('bind mode verifies the deployment record identity before anything is signed', async () => {
+  const result = await runReleasePreflight(
+    bindConfig({ record: { network: 'portaldotTestnet', chainId: 420420777, deployer: `0x${'99'.repeat(20)}`, contracts: {}, tokens: {}, bindings: [] } }),
+    bindProbes()
+  );
+  assert.equal(result.ok, false);
+  const row = result.checks.find((check) => check.name === 'deployment record identity (network, chainId, deployer)');
+  assert.equal(row.pass, false);
+  assert.match(row.detail, /does not match the binding identity/);
+});
+
+test('bind mode rejects a wrong-record network and chainId', async () => {
+  for (const broken of [
+    { network: 'otherNet', chainId: 420420777 },
+    { network: 'portaldotTestnet', chainId: 5 },
+  ]) {
+    const result = await runReleasePreflight(
+      bindConfig({ record: { ...broken, deployer: DEPLOYER_EVM } }),
+      bindProbes()
+    );
+    assert.equal(result.ok, false);
+    assert.ok(result.failures.includes('deployment record identity (network, chainId, deployer)'));
+  }
+});
+
+test('bind mode requires live bytecode at the registry and both tokens', async () => {
+  const targets = { PotRegistry: REGISTRY_ADDR, PotERC20: TOKEN_ERC20, PotERC721: TOKEN_ERC721 };
+  for (const target of Object.keys(targets)) {
+    const result = await runReleasePreflight(bindConfig(), bindProbes([], {
+      code: async (address) => address.toLowerCase() === String(targets[target]).toLowerCase() ? '0x' : '0x5bff',
+    }));
+    assert.equal(result.ok, false);
+    assert.ok(result.failures.includes(`${target} bytecode present`));
+  }
+});
+
+test('bind mode still fails when native counterpart configuration is incomplete', async () => {
+  const result = await runReleasePreflight(
+    bindConfig({ nativeObjects: [{ kind: 'asset', id: 1 }] }),
+    bindProbes()
+  );
+  assert.equal(result.ok, false);
+  assert.ok(result.failures.includes('native counterparts configured'));
 });

@@ -196,6 +196,70 @@ test('validateDeploymentRecord rejects malformed records fail-closed', () => {
   assert.throws(() => validateDeploymentRecord(noTokens), /no tokens table/);
 });
 
+test('validateDeploymentRecord accepts pending, per-transaction entries and partial records', () => {
+  // A resumable record written immediately after the first send: the first
+  // contract is pending (txHash only), the others are not present yet.
+  const pending = validRecord();
+  pending.contracts = {
+    PotERC20: {
+      txHash: `0x${'11'.repeat(32)}`,
+      gasLimit: '1000',
+      status: 'pending',
+    },
+  };
+  pending.tokens = {};
+  assert.doesNotThrow(() => validateDeploymentRecord(pending));
+
+  // A partial record with one confirmed contract: valid, resume-usable.
+  const partial = validRecord();
+  partial.contracts = {
+    PotERC20: {
+      address: '0x0000000000000000000000000000000000000001',
+      txHash: `0x${'11'.repeat(32)}`,
+      blockNumber: 1,
+      status: 'confirmed',
+    },
+  };
+  partial.tokens = { erc20: { address: '0x0000000000000000000000000000000000000001', name: 'a', symbol: 'POT', decimals: 18 } };
+  assert.doesNotThrow(() => validateDeploymentRecord(partial));
+
+  // Legacy records without a status field behave as confirmed entries.
+  const legacy = validRecord();
+  delete legacy.contracts.PotERC20.status;
+  assert.doesNotThrow(() => validateDeploymentRecord(legacy));
+});
+
+test('validateDeploymentRecord still rejects malformed pending entries', () => {
+  // pending without any txHash is invalid: the record entry is written with
+  // the transaction hash the moment the transaction is sent.
+  const missingHash = validRecord();
+  missingHash.contracts = { PotERC20: { status: 'pending' } };
+  missingHash.tokens = {};
+  assert.throws(() => validateDeploymentRecord(missingHash), /txHash is not a 32-byte transaction hash/);
+
+  // An invalid status aborts.
+  const badStatus = validRecord();
+  badStatus.contracts.PotERC20.status = 'maybe';
+  assert.throws(() => validateDeploymentRecord(badStatus), /invalid status/);
+
+  // A confirmed entry without an address aborts.
+  const noAddress = validRecord();
+  noAddress.contracts.PotERC20 = { txHash: `0x${'11'.repeat(32)}`, status: 'confirmed' };
+  assert.throws(() => validateDeploymentRecord(noAddress), /address is required for a confirmed entry/);
+
+  // Pending entries may carry a valid address (recovered from chain), but a
+  // malformed one is never accepted.
+  const badPendingAddress = validRecord();
+  badPendingAddress.contracts = { PotERC20: { address: 'nope', txHash: `0x${'11'.repeat(32)}`, status: 'pending' } };
+  badPendingAddress.tokens = {};
+  assert.throws(() => validateDeploymentRecord(badPendingAddress), /EVM address/);
+
+  // Negative or fractional blockNumbers abort.
+  const badBlock = validRecord();
+  badBlock.contracts.PotERC20.blockNumber = -1;
+  assert.throws(() => validateDeploymentRecord(badBlock), /blockNumber/);
+});
+
 function validRecord() {
   return {
     network: 'portaldotTestnet',

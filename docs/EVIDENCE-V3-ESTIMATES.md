@@ -34,16 +34,40 @@ earlier on the chain (32,580 wei), the same deployment costs ≈ 1,198 tPOT; req
 
 ## 3. Funding requirement
 
-Request at least **1,350 tPOT** for the native account that maps to the deployer EVM address, so the
-suite deploys with a margin at the current base fee. The base fee is not fixed: it was 32,580 wei
-earlier in the chain history and 29,790 wei at the time of the last measurement, so a larger buffer
-is wise if the price moves.
+The whole-release requirement is computed from live measurements, not from a fixed historical figure:
 
-The grant has to reach the **native** account that corresponds to the EVM key. For an EVM address
-the native account is the 20-byte H160 followed by twelve `0xEE` bytes, encoded as SS58 with prefix
-42, and the deployer needs at least 1,350 tPOT there before the EVM side sees the balance.
+| Component | Basis | Value at 27,440 wei gas price |
+| --- | --- | --- |
+| Deployment estimate | 3 contract creation estimates × gas price | ≈ 1,209.9 tPOT |
+| Binding reserve | 2 registry bindings × registry creation estimate (heaviest measured registry transaction; no bind-call measurement exists in the evidence docs) | ≈ 913.7 tPOT |
+| Subtotal | deployment + binding reserve | ≈ 2,123.6 tPOT |
+| Fee margin | 20% on the subtotal (observed base-fee swing 29,790 → 32,580 wei ≈ +19%) | ≈ 424.7 tPOT |
+| **Whole-release recommended balance** | subtotal + margin | ≥ **2,549 tPOT** |
 
-## 4. Accounts observed on the testnet
+The legacy 1,350 tPOT figure covered only the deployment estimate and is **insufficient for the whole
+release** once both registry bindings and the fee margin are included. Request ≥ 2,549 tPOT for the
+native account that maps to the deployer EVM address so the full release (deploy + both bindings +
+margin) clears the preflight. Native balances use 14 decimals and EVM balances use 18 decimals; both
+are compared in BigInt end to end.
+
+The release preflight recomputes this requirement live before the first transaction and fails closed
+if either ledger's balance is insufficient. After deployment has spent its funds, the binding stage is
+stage-aware: it budgets only the remaining binding transactions (each re-estimated live), never the
+original deployment balance again.
+
+## 4. Binding reserve derivation (evidence status)
+
+No bind-call cost measurement exists in the evidence docs (checked `docs/EVIDENCE-V3-ESTIMATES.md`,
+`docs/PORTALDOT_PREFLIGHT.md`, `docs/decisions/001-product-lock.md`, and `README.md`). The only
+measured call figures are a light call ≈ 0.0153 tPOT and a storage-heavy call ≈ 58.94 tPOT from
+earlier research (ADR 001), neither of which is a registry `bind` transaction. A live
+`eth_estimateGas` of `bind` is impossible before the registry is deployed (the target contract does
+not yet exist on chain).
+
+The safest supported reserve is therefore an **upper bound**: each of the two bindings is bounded by
+the PotRegistry creation estimate itself — the heaviest measured registry transaction (15,342,985,002,896,258 gas ≈ 456.88 tPOT at 27,440 wei) — because a state-changing registry call is bounded by the contract creation that establishes that state, and no smaller measured figure is available. This is deliberately conservative: the actual bind cost is re-measured read-only at binding time via the bind-mode preflight (`eth_estimateGas` on both `bind` calls), so the final binding budget can only go down from this reserve.
+
+## 5. Accounts observed on the testnet
 
 | EVM address | Balance (EVM wei) | Note |
 | --- | --- | --- |
@@ -55,7 +79,7 @@ the native account is the 20-byte H160 followed by twelve `0xEE` bytes, encoded 
 None of these balances belong to this project, and no private key for them is available here. The
 deployment therefore waits on a funded deployer account.
 
-## 5. Reproduction
+## 6. Reproduction
 
 ```bash
 npm run compile
