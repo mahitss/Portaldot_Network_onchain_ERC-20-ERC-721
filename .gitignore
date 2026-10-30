@@ -16,3 +16,4 @@ deployments/hardhat.json
 app/bundle.js
 .vscode/
 .idea/
+graphify-out/

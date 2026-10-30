@@ -11,8 +11,9 @@ npm run check
 npm run check:funding
 ```
 
-`npm run check` compiles, regenerates the SDK ABI, and runs both test suites (31 contract tests,
-6 SDK tests). `npm run check:funding` must report `funded: true` before anything else.
+`npm run check` compiles, regenerates the SDK ABI, and runs all three test suites (72 contract
+tests, 13 SDK tests, 115 release-safety tests including 20 offline lifecycle/recovery tests).
+`npm run check:funding` must report `funded: true` before anything else.
 
 ## 1. Deploy and bind (one command)
 
@@ -20,13 +21,51 @@ npm run check:funding
 npm run release:testnet
 ```
 
-This deploys `PotERC20`, `PotERC721`, and `PotRegistry`, binds the ERC-20 to native asset 1 and the
-ERC-721 to native NFT collection 1, and prints the verification report. The artifact to show is
-`deployments/portaldotTestnet.json`, which holds the contract addresses, transaction hashes, and
-block numbers.
+The release is **stage-aware** and **resumable**:
 
-If the release has already run, `npm run verify:deployment` re-checks bytecode, receipts, registry
-state, and bindings without sending anything.
+- **Deployment preflight** (before the first broadcast): verifies chain id 420420777, the deployer identity and its mapped native account, the whole-release funding requirement (measured creation estimates + binding reserve + 20% fee margin) on both ledgers in their own units, the required native asset and NFT collection, the compiled artifacts, and the gas plan. Only when every check passes does it deploy `PotERC20`, `PotERC721`, and `PotRegistry`.
+- **Each deployment is persisted immediately** after it is sent (pending entry), then confirmed after a validated receipt. Rerunning the release reuses confirmed contracts instead of redeploying them, so a rerun never deploys duplicates or overwrites recorded evidence.
+- **Binding preflight** (after deployment funds have been spent): verifies the deployment record identity, the live bytecode, the native counterparts, and budgets **only the remaining binding transactions** (each re-estimated live with `eth_estimateGas`). It never demands the original deployment balance again. Already-bound tokens are compared field-by-field against the intended configuration and abort on mismatch.
+- A malformed or mismatched deployment record is never silently overwritten; replacing it requires the explicit `POT_FORCE_FRESH_RELEASE=1` operation, which archives the old record first.
+
+Then it prints the verification report. The artifact to show is
+`deployments/portaldotTestnet.json`, which holds the contract addresses,
+transaction hashes, block numbers, and the expected binding configuration with
+its transaction evidence.
+
+A preflight pass proves the configuration was safe before the first transaction,
+not that contracts are on chain. Use `verify:deployment` (included as the final
+step) for on-chain proof.
+
+### Retry and recovery
+
+The release is safe to rerun after an interruption:
+
+- If a deployment transaction was sent but its receipt was not persisted, the
+  next run reconciles the pending entry from the chain receipt instead of
+  redeploying (crash-after-send recovery).
+- If a receipt cannot be found, the outcome is treated as ambiguous and the
+  run fails closed — nothing is redeployed.
+- If one of the two bindings already succeeded, rerunning `bind:testnet`
+  verifies it against the intended configuration and sends only the missing
+  binding.
+- A deliberately fresh deployment requires `POT_FORCE_FRESH_RELEASE=1` and
+  archives (never deletes) the previous record.
+
+Before running, you must set the native binding IDs:
+
+```bash
+export POT_NATIVE_ASSET_ID=1
+export POT_NATIVE_NFT_ID=1
+```
+
+These IDs must correspond to live native objects on the Portaldot V3 testnet (see
+`npm run dual:read` to inspect existing assets and collections). The preflight rejects
+`Option::None` native objects, misconfigured ids, insufficient funding, or missing artifacts
+before signing, so an invalid id is caught with zero funds spent. The registry does not
+automatically create or synchronize native objects: create the asset and collection on the native
+side first. Restarting an intentionally unbound release is a deliberate, documented selection
+(`POT_ALLOW_UNBOUND=true` for verification) and is not part of this demo.
 
 ## 2. Show the dual ledger console
 
@@ -83,9 +122,7 @@ console.log(state, binding.conversionFactor, account.ss58);
   is 10,000 EVM wei. Every conversion in the suite is derived from stored decimals, never hardcoded.
 - The mapping is deterministic and verifiable: H160 followed by twelve `0xEE` bytes, SS58 prefix 42,
   checked against the pairs published in the official Portaldot guide.
-- The economics force the architecture: a deployment on this chain costs roughly 911 tPOT for this
-  suite against 0.0153 tPOT for a light call, so the design is one shared deployment with per user
-  state in the registry, never per user contracts.
+- The economics force the architecture: the whole-release recommended balance is ≈ 2,549 tPOT (measured creation estimates ≈ 1,209.9 tPOT for deployment, ≈ 913.7 tPOT binding reserve for the two registry bindings, plus a 20% fee margin), against 0.0153 tPOT for a light call — so the design is one shared deployment with per-user state in the registry, never per-user contracts. The old 1,350 tPOT figure covered only deployment and is insufficient for the full release.
 - Verification is scripted, not asserted: `npm run check`, `npm run verify:deployment`, and
   `npm run dual:read` reproduce every claim on demand.
 

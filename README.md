@@ -5,8 +5,9 @@ token to its native `assets` or `nfts` counterpart, stores both decimal bases, a
 SHA-256 commitment to the native account derived from the EVM identity.
 
 The suite is deployed once per network and shared by every user. A Portaldot V3 contract deploy
-costs roughly 529.84 tPOT, so per-user contracts are not viable; one shared deployment with a
-binding registry keeps the cost fixed while still giving every holder a verifiable native link.
+costs hundreds of tPOT (see the read-only estimates below), so per-user contracts are not viable;
+one shared deployment with a binding registry keeps the cost fixed while still giving every holder
+a verifiable native link.
 
 ## Components
 
@@ -98,9 +99,15 @@ npm run deploy:testnet
 npm run verify:deployment
 ```
 
-`deploy:testnet` writes `deployments/portaldotTestnet.json` with the contract addresses, deployment
-transaction hashes, block numbers, and token metadata. Bind the deployed tokens to their native
-counterparts afterwards:
+`deploy:testnet` runs the stage-aware release preflight before broadcasting: chain id 420420777,
+deployer identity and mapped native account, the whole-release funding requirement (measured
+creation estimates for all outstanding contracts, a binding reserve for the outstanding registry
+bindings, and a documented fee-fluctuation margin) on both ledgers in their own units, explicit
+configured native counterparts and their existence on the native runtime, artifact byte sizes, and
+the gas plan (see `scripts/lib/preflight.cjs`). If any check fails, nothing is signed. On success
+it writes `deployments/portaldotTestnet.json` with the contract addresses, deployment transaction
+hashes, block numbers, and token metadata. Bind the deployed tokens to their native counterparts
+afterwards:
 
 ```bash
 export POT_NATIVE_ASSET_ID=1
@@ -108,8 +115,21 @@ export POT_NATIVE_NFT_ID=1
 npm run bind:testnet
 ```
 
-`POT_NATIVE_ACCOUNT` optionally overrides the account whose commitment is stored, and
-`POT_NATIVE_ACCOUNT_HASH` accepts a precomputed commitment.
+`bind:testnet` is stage-aware too: because deployment has already spent its funds, its preflight
+budgets **only the remaining binding transactions** (each re-estimated live with `eth_estimateGas`)
+and never demands the original deployment balance again. It revalidates the deployment record
+identity and live bytecode, compares an already-bound token against the intended configuration
+instead of blindly accepting it, and aborts on any mismatch. A pending binding entry is reconciled
+from its chain receipt instead of sending a duplicate transaction. `POT_NATIVE_ACCOUNT_EVM`
+optionally overrides the EVM address whose mapped native account commitment is stored (the legacy
+name `POT_NATIVE_ACCOUNT` is still accepted), and `POT_NATIVE_ACCOUNT_HASH` accepts a precomputed
+commitment.
+
+The deployment flow is resumable and idempotent: each confirmed contract is persisted immediately
+after it is sent, and rerunning `deploy:testnet` reuses confirmed contracts instead of redeploying
+them, so a rerun never deploys duplicates or overwrites recorded evidence. A malformed or mismatched
+deployment record is never silently overwritten; replacing it requires the explicit
+`POT_FORCE_FRESH_RELEASE=1` operation, which archives the old record first.
 
 ## Scripts
 
@@ -119,7 +139,8 @@ npm run bind:testnet
 | `npm run abi` | Regenerate `sdk/abi.generated.mjs` from the compiled artifacts. |
 | `npm test` | Run the Hardhat contract test suite. |
 | `npm run test:sdk` | Run the shared primitive tests with the Node test runner. |
-| `npm run check` | Compile, regenerate ABIs, and run both test suites. |
+| `npm run test:release` | Run the offline release-safety tests (funding units, native Option handling, preflight ordering, gas plan, verification, lifecycle/recovery). |
+| `npm run check` | Compile, regenerate ABIs, and run all three test suites plus the app build. |
 | `npm run preflight` | Check the runtime, artifacts, RPC reachability, chain id, and deployed bytecode. |
 | `npm run deploy:testnet` | Deploy the three contracts to Portaldot V3 and write the deployment file. |
 | `npm run estimate:deploy` | Estimate the deployment cost of the three contracts on the live testnet through `eth_estimateGas`, without needing funds. |
@@ -138,12 +159,16 @@ npm run bind:testnet
 | `PORTALDOT_WS_URL` | Native WebSocket endpoint, defaults to `wss://test-node-v3.portaldot.dev`. |
 | `PORTALDOT_NETWORK` | Deployment file name, defaults to `portaldotTestnet`. |
 | `POT_DEPLOYMENTS` | Path to a deployment file for the verification script. |
-| `POT_GAS_LIMIT` | Gas limit used for deployment transactions, defaults to 5000000. |
+| `POT_GAS_LIMIT` | Optional fixed gas limit for deployment transactions, in the chain's gas units (BigInt-safe). If set, the preflight requires it to be a positive integer at or above the RPC's own creation estimate and at or below the block gas limit. If unset, the limit per contract is the creation estimate plus a 20 percent margin. |
 | `POT_GAS_PRICE` | Gas price used by the cost estimator, defaults to the live base fee. |
-| `POT_NATIVE_ASSET_ID` | Native asset id for the ERC-20 binding. |
-| `POT_NATIVE_NFT_ID` | Native NFT collection id for the ERC-721 binding. |
-| `POT_NATIVE_ACCOUNT` | EVM address whose native account commitment is stored. |
+| `POT_REQUIRED_TPOT` | Manual whole-release funding floor in whole tPOT (defaults to 1350). The preflight computes the whole-release requirement from live estimates and only raises it if this floor is higher; the floor never lowers the computed requirement. |
+| `POT_RELEASE_FEE_MARGIN_PCT` | Fee-fluctuation margin applied to the whole-release budget, an integer percent 0–100 (defaults to 20; observed base-fee swing was ≈ +19%). |
+| `POT_FORCE_FRESH_RELEASE` | Set to `1` to deliberately replace the existing deployment record. The old record is archived (never deleted) before restarting; without it a malformed or mismatched record aborts the release. |
+| `POT_NATIVE_ASSET_ID` | Native asset id for the ERC-20 binding; required for the dual-ledger release and must exist on the native runtime. |
+| `POT_NATIVE_NFT_ID` | Native NFT collection id for the ERC-721 binding; required for the dual-ledger release and must exist on the native runtime. |
+| `POT_NATIVE_ACCOUNT_EVM` | EVM address whose native account commitment is stored; the legacy name `POT_NATIVE_ACCOUNT` is still accepted. SS58 addresses are always rejected here. |
 | `POT_NATIVE_ACCOUNT_HASH` | Precomputed SHA-256 commitment. |
+| `POT_ALLOW_UNBOUND` | Explicit opt-out allowing `verify:deployment` to pass with zero recorded bindings (`true` only). |
 
 ## Deployment cost
 
@@ -158,9 +183,32 @@ cancun evm version and optimizer 200 runs (no viaIR). Measured on the live testn
 | `PotRegistry` | 5,636 | 5,545 | ≈ 460.56 tPOT |
 | **Total** | 16,636 | 14,194 | **≈ 1,205.11 tPOT** |
 
-Per-contract runtime is under the 10,240 byte Revive limit. Request at least **1,350 tPOT** for
-the deployer account; base fees vary (measured between 29,790 and 32,580 wei), so a margin is
-advisable. `npm run estimate:deploy` refreshes the numbers against the live base fee.
+Per-contract runtime is under the 10,240 byte Revive limit. The three clearly labeled release
+budgets (BigInt throughout; costs exceed 2^53 gas units):
+
+| Budget | Label | Value (measured 2026-10-29 at ≈ 27,440 wei) |
+| --- | --- | --- |
+| **Minimum deployment budget** | deployment estimates only, not the total release cost | ≈ 1,209.9 tPOT |
+| **Remaining binding budget** | reserve for the 2 registry bindings, bounded by the registry creation estimate (heaviest measured registry transaction) | ≈ 913.7 tPOT |
+| **Whole-release recommended balance** | minimum deployment budget + binding reserve + 20% fee margin | ≥ **2,549 tPOT** |
+
+The legacy 1,350 tPOT recommendation covered only the deployment estimate and is **insufficient for
+the whole release** — do not rely on it as the final funding target. Base fees vary (measured
+between 29,790 and 32,580 wei), so the 20% margin is applied on top of the measured subtotal.
+`npm run estimate:deploy` refreshes the numbers against the live base fee, and the release
+preflight recomputes the whole-release requirement live before the first transaction, failing
+closed if either ledger's balance is insufficient (native balances use 14 decimals, EVM balances
+use 18 decimals; both compared in BigInt).
+
+### Gas units on this chain
+
+These are Substrate/PolkaVM-scale gas numbers, not 12-million-EVM-scale numbers: a read-only probe
+(2026-10-29) returned a block gas limit of `18446744073709551615` (`u64::MAX`) and per-contract
+creation estimates between `1.06e16` and `1.69e16` gas units, which exceed JavaScript's safe
+integer range, so they are handled as `BigInt` end to end. A fixed `POT_GAS_LIMIT` of `5,000,000`
+cannot succeed here. The release therefore never guesses: without the variable, each contract gets
+its RPC creation estimate plus a 20 percent margin; with it, the configured value must cover the
+estimate and fit within the block limit or the preflight refuses to broadcast.
 
 ## Platform facts
 
@@ -168,8 +216,7 @@ advisable. `npm run estimate:deploy` refreshes the numbers against the live base
   `wss://test-node-v3.portaldot.dev`
 - Runtime `portaldot-v3` with `pallet-revive`, `pallet_contracts`, `pallet-assets`, and `pallet-nfts`
 - Contract code size limit 10240 bytes; the deployed suite is roughly 3.3 kB, 5.4 kB, and 5.5 kB
-- One shared deployment of this suite costs about 1,205 tPOT at the measured base fee, a light call
-  about 0.0153 tPOT, and a storage-heavy call about 58.94 tPOT
+- One shared deployment of this suite costs about 1,205 tPOT at the measured base fee (deployment estimate only — the whole-release recommended balance is ≥ 2,549 tPOT including the binding reserve and fee margin); a light call about 0.0153 tPOT, and a storage-heavy call about 58.94 tPOT
 
 The full evidence trail is in `docs/PORTALDOT_PREFLIGHT.md`, and the product decision record is in
 `docs/decisions/002-product-lock-revision.md`.
