@@ -41,6 +41,7 @@ const { runPreflight } = require('./lib/preflight.cjs');
 const { buildLiveProbes } = require('./lib/probes.cjs');
 const { readJsonRecord, writeJsonAtomic, archiveRecord } = require('./lib/persistence.cjs');
 const { loadSharedMapping } = require('./lib/shared-loader.cjs');
+const { assertReleasePlanMatchesEnv, validateReleasePlan } = require('./deploy.js');
 
 const root = path.resolve(__dirname, '..');
 
@@ -247,6 +248,30 @@ async function runBinding({
   }
   if (Number(record.chainId) !== Number(chainId)) {
     throw new Error(`deployment record chainId mismatch: the record says ${record.chainId}, the connected chain is ${chainId}`);
+  }
+
+  // Validate the frozen release plan against the environment before building
+  // the bind preflight config. The plan is authoritative: env drift aborts
+  // before any binding transaction is signed.
+  if (record.releasePlan) {
+    validateReleasePlan(record.releasePlan);
+    // The bind signer must be the same identity as the deployment deployer.
+    const signerEvm = validateEvmAddress(signerAddress, 'signer EVM address');
+    if (signerEvm !== record.releasePlan.deployer) {
+      throw new Error(
+        `bind signer ${signerEvm} does not match the release plan deployer ${record.releasePlan.deployer}. ` +
+          'Refusing to bind with a mismatched identity. Use POT_FORCE_FRESH_RELEASE=1 on the deployment to start a new release.'
+      );
+    }
+    assertReleasePlanMatchesEnv(record.releasePlan, env);
+  } else {
+    // A valid legacy record without a release plan cannot be bound safely:
+    // we cannot know the historical token names, symbols, native IDs or
+    // commitment, so fail closed.
+    throw new Error(
+      `the deployment record at ${recordFile} was written before release plans were introduced and has no frozen plan. ` +
+        'Refusing to bind without knowing the historical configuration. Set POT_FORCE_FRESH_RELEASE=1 on the deployment to start a new release.'
+    );
   }
 
   const config = await buildPreflightConfig({

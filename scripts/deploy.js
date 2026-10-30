@@ -228,13 +228,117 @@ function assertReleasePlanMatchesEnv(plan, env) {
           'Refusing to drift the recorded deployment configuration. Use POT_FORCE_FRESH_RELEASE=1 to archive this record and start a new release.'
       );
     }
+    if (planned && configured) {
+      const envIdRaw = kind === 'asset' ? env.POT_NATIVE_ASSET_ID : env.POT_NATIVE_NFT_ID;
+      const envId = validateNativeId(envIdRaw, `POT_NATIVE_${kind === 'asset' ? 'ASSET' : 'NFT'}_ID`);
+      if (planned.id !== envId) {
+        throw new Error(
+          `release plan binds native ${kind} id ${planned.id} but the environment configures ${envId}. ` +
+            'Refusing to drift the recorded deployment configuration. Use POT_FORCE_FRESH_RELEASE=1 to archive this record and start a new release.'
+        );
+      }
+    }
   }
-  if (env.POT_NATIVE_ACCOUNT_HASH !== undefined && env.POT_NATIVE_ACCOUNT_HASH !== '' && env.POT_NATIVE_ACCOUNT_HASH !== plan.nativeAccountHash) {
+  // Always compare the native account hash: if the environment uses a derived
+  // commitment, recompute it and compare; if an override is set, compare directly.
+  let envAccountHash;
+  if (env.POT_NATIVE_ACCOUNT_HASH !== undefined && env.POT_NATIVE_ACCOUNT_HASH !== '') {
+    envAccountHash = env.POT_NATIVE_ACCOUNT_HASH;
+  } else {
+    // Derived commitment: SHA-256 of the 32-byte native account (H160 + 12x0xEE).
+    // The deployer EVM address from the plan is used since the signer identity
+    // must agree with the record deployer (checked separately).
+    const { createHash } = require('node:crypto');
+    envAccountHash = `0x${createHash('sha256').update(Buffer.from(`${plan.deployer.slice(2)}${'ee'.repeat(12)}`, 'hex')).digest('hex')}`;
+  }
+  if (envAccountHash !== plan.nativeAccountHash) {
     throw new Error(
-      'POT_NATIVE_ACCOUNT_HASH conflicts with the release plan native account hash. Refusing to drift the recorded deployment configuration. ' +
-        'Use POT_FORCE_FRESH_RELEASE=1 to archive this record and start a new release.'
+      `native account commitment conflicts with the release plan. Expected ${plan.nativeAccountHash}, computed ${envAccountHash}. ` +
+        'Refusing to drift the recorded deployment configuration. Use POT_FORCE_FRESH_RELEASE=1 to archive this record and start a new release.'
     );
   }
+}
+
+// Builds the immutable release plan from a validated preflight config.
+// The plan is the authoritative source for token metadata, native binding
+// targets and constructor arguments on every retry. It must be constructed
+// before the first transaction is signed or broadcast and persisted atomically
+// in the deployment record.
+function buildReleasePlan({ config, networkName, chainId }) {
+  if (!config || !config.tokenConfig || !config.nativeObjects) {
+    throw new Error('cannot build release plan: config is missing tokenConfig or nativeObjects');
+  }
+  const assetObject = config.nativeObjects.find((object) => object.kind === 'asset');
+  const nftObject = config.nativeObjects.find((object) => object.kind === 'nft_collection');
+  if (!assetObject || !nftObject) {
+    throw new Error('cannot build release plan: config is missing asset or nft_collection native object');
+  }
+  return {
+    version: RELEASE_PLAN_VERSION,
+    network: networkName,
+    chainId: Number(chainId),
+    deployer: config.deployerEvm,
+    tokenConfig: {
+      erc20Name: config.tokenConfig.erc20Name,
+      erc20Symbol: config.tokenConfig.erc20Symbol,
+      erc721Name: config.tokenConfig.erc721Name,
+      erc721Symbol: config.tokenConfig.erc721Symbol,
+    },
+    nativeObjects: [
+      { kind: 'asset', id: assetObject.id },
+      { kind: 'nft_collection', id: nftObject.id },
+    ],
+    nativeAccountHash: config.nativeAccountHash,
+    commitmentSource: config.commitmentSource,
+  };
+}
+
+// Validates that a persisted release plan contains all required fields and
+// that they are well-formed. Throws on any missing or malformed entry so the
+// release fails closed instead of guessing historical settings.
+function validateReleasePlan(plan) {
+  if (!plan || typeof plan !== 'object') {
+    throw new Error('release plan is missing or not an object. Use POT_FORCE_FRESH_RELEASE=1 to archive this record and start a new release.');
+  }
+  if (typeof plan.version !== 'number' || plan.version !== RELEASE_PLAN_VERSION) {
+    throw new Error(`release plan version is missing or unsupported (${plan && plan.version}). Use POT_FORCE_FRESH_RELEASE=1 to archive this record and start a new release.`);
+  }
+  if (typeof plan.network !== 'string' || plan.network.length === 0) {
+    throw new Error('release plan has no network name. Use POT_FORCE_FRESH_RELEASE=1 to archive this record and start a new release.');
+  }
+  if (typeof plan.chainId !== 'number' || Number(plan.chainId) !== CHAIN_ID) {
+    throw new Error(`release plan chainId is missing or invalid (${JSON.stringify(plan && plan.chainId)}). Use POT_FORCE_FRESH_RELEASE=1 to archive this record and start a new release.`);
+  }
+  if (typeof plan.deployer !== 'string') {
+    throw new Error('release plan has no deployer. Use POT_FORCE_FRESH_RELEASE=1 to archive this record and start a new release.');
+  }
+  validateEvmAddress(plan.deployer, 'release plan deployer');
+  if (!plan.tokenConfig || typeof plan.tokenConfig !== 'object') {
+    throw new Error('release plan is missing token configuration. Use POT_FORCE_FRESH_RELEASE=1 to archive this record and start a new release.');
+  }
+  for (const field of ['erc20Name', 'erc20Symbol', 'erc721Name', 'erc721Symbol']) {
+    if (typeof plan.tokenConfig[field] !== 'string' || plan.tokenConfig[field].length === 0) {
+      throw new Error(`release plan tokenConfig.${field} is missing or empty. Use POT_FORCE_FRESH_RELEASE=1 to archive this record and start a new release.`);
+    }
+  }
+  if (!Array.isArray(plan.nativeObjects) || plan.nativeObjects.length !== 2) {
+    throw new Error('release plan has invalid nativeObjects. Use POT_FORCE_FRESH_RELEASE=1 to archive this record and start a new release.');
+  }
+  const kinds = new Set(plan.nativeObjects.map((object) => object.kind));
+  if (!kinds.has('asset') || !kinds.has('nft_collection')) {
+    throw new Error('release plan nativeObjects must include both asset and nft_collection. Use POT_FORCE_FRESH_RELEASE=1 to archive this record and start a new release.');
+  }
+  for (const object of plan.nativeObjects) {
+    validateNativeId(object.id, `release plan nativeObjects ${object.kind} id`);
+  }
+  if (typeof plan.nativeAccountHash !== 'string') {
+    throw new Error('release plan has no nativeAccountHash. Use POT_FORCE_FRESH_RELEASE=1 to archive this record and start a new release.');
+  }
+  validateNativeAccountHash(plan.nativeAccountHash, 'release plan nativeAccountHash');
+  if (plan.commitmentSource !== 'derived' && plan.commitmentSource !== 'override') {
+    throw new Error('release plan has invalid commitmentSource. Use POT_FORCE_FRESH_RELEASE=1 to archive this record and start a new release.');
+  }
+  return plan;
 }
 
 function newRecord({ config, networkName, chainId, releasePlan }) {
@@ -257,19 +361,6 @@ function loadArtifact(artifactFile) {
   } catch (error) {
     throw new Error(`cannot read contract artifact ${artifactFile}: ${error.message}. Run "npm run compile" first.`);
   }
-}
-
-function newRecord({ config, networkName, chainId }) {
-  return {
-    network: networkName,
-    chainId: Number(chainId),
-    deployer: config.deployerEvm,
-    deployedAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    contracts: {},
-    tokens: {},
-    bindings: [],
-  };
 }
 
 // Keeps the tokens table in lockstep with confirmed contract entries; tokens
@@ -312,20 +403,36 @@ async function reconcilePendingEntry(name, entry, probes) {
     );
   }
   validateReceipt(entry.txHash, receipt);
-  const address = typeof receipt.contractAddress === 'string' ? receipt.contractAddress : entry.address;
-  if (typeof address !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(address)) {
-    throw new Error(`cannot reconcile ${name}: the receipt for ${entry.txHash} does not contain a usable contract address`);
+  // For a pending contract-creation transaction, the receipt MUST contain a
+  // valid contractAddress. Never substitute a stored address: that would
+  // permit reusing an unrelated contract.
+  if (typeof receipt.contractAddress !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(receipt.contractAddress)) {
+    throw new Error(
+      `cannot reconcile ${name}: the receipt for ${entry.txHash} does not contain a valid contract-creation address; the outcome is ambiguous, refusing to reuse or redeploy`
+    );
   }
-  const code = await probes.code(address);
+  // If the journal recorded an address, require it to match the receipt.
+  if (typeof entry.address === 'string' && String(receipt.contractAddress).toLowerCase() !== String(entry.address).toLowerCase()) {
+    throw new Error(
+      `cannot reconcile ${name}: the receipt contract address ${receipt.contractAddress} does not match the journaled address ${entry.address}; refusing to reuse or redeploy`
+    );
+  }
+  // Require a valid block number for both pending and confirmed entries.
+  if (!Number.isSafeInteger(receipt.blockNumber) || receipt.blockNumber < 0) {
+    throw new Error(
+      `cannot reuse ${name}: the receipt for ${entry.txHash} has an invalid block number ${JSON.stringify(receipt.blockNumber)}; refusing to reuse or redeploy`
+    );
+  }
+  const code = await probes.code(receipt.contractAddress);
   if (typeof code !== 'string' || code === '0x') {
     throw new Error(
-      `cannot reconcile ${name}: the receipt reports success but no bytecode exists at ${address}; the outcome is ambiguous, refusing to reuse or redeploy`
+      `cannot reconcile ${name}: the receipt reports success but no bytecode exists at ${receipt.contractAddress}; the outcome is ambiguous, refusing to reuse or redeploy`
     );
   }
   return {
-    address,
+    address: receipt.contractAddress,
     txHash: entry.txHash,
-    blockNumber: Number(receipt.blockNumber),
+    blockNumber: receipt.blockNumber,
     gasLimit: entry.gasLimit,
     status: 'confirmed',
   };
@@ -364,6 +471,12 @@ async function verifyConfirmedEntry(name, entry, probes) {
   ) {
     throw new Error(
       `cannot reuse ${name}: the recorded block number ${entry.blockNumber} does not match the receipt block number ${receipt.blockNumber}; the record and the chain disagree.`
+    );
+  }
+  // Require the receipt's block number to be present and valid.
+  if (!Number.isSafeInteger(receipt.blockNumber) || receipt.blockNumber < 0) {
+    throw new Error(
+      `cannot reuse ${name}: the receipt for ${entry.txHash} has an invalid block number ${JSON.stringify(receipt.blockNumber)}; refusing to reuse or redeploy`
     );
   }
   const code = await probes.code(entry.address);
@@ -426,7 +539,11 @@ async function runRelease({
   const reuseNotes = [];
   let frozenPlan = null;
   if (loaded.status === 'missing') {
-    record = newRecord({ config, networkName, chainId });
+    // Fresh release: construct the immutable release plan from the environment
+    // before any transaction is signed or broadcast, and persist it in the
+    // record. Never reconstruct historical settings from current defaults.
+    const releasePlan = buildReleasePlan({ config, networkName, chainId });
+    record = newRecord({ config, networkName, chainId, releasePlan });
   } else if (loaded.status === 'malformed') {
     if (!forceFresh) {
       throw new Error(
@@ -434,7 +551,8 @@ async function runRelease({
       );
     }
     archived.push(recordIo.archive(recordFile));
-    record = newRecord({ config, networkName, chainId });
+    const releasePlan = buildReleasePlan({ config, networkName, chainId });
+    record = newRecord({ config, networkName, chainId, releasePlan });
     stderr.write(`fresh release: malformed record archived, starting a clean release\n`);
   } else {
     let data = null;
@@ -447,10 +565,19 @@ async function runRelease({
         );
       }
       archived.push(recordIo.archive(recordFile));
-      record = newRecord({ config, networkName, chainId });
+      const releasePlan = buildReleasePlan({ config, networkName, chainId });
+      record = newRecord({ config, networkName, chainId, releasePlan });
       stderr.write(`fresh release: invalid record archived, starting a clean release\n`);
     }
     if (data) {
+      // A valid legacy record without a release plan cannot be resumed safely:
+      // we cannot know the historical settings, so fail closed with clear
+      // recovery instructions unless an explicit fresh release is requested.
+      if (!data.releasePlan && !forceFresh) {
+        throw new Error(
+          `the deployment record at ${recordFile} was written before release plans were introduced and has no frozen plan. Refusing to resume without knowing the historical token names, symbols, native IDs and commitment. Set POT_FORCE_FRESH_RELEASE=1 to archive this record and start a new release.`
+        );
+      }
       if (data.network !== networkName) {
         throw new Error(
           `the deployment record belongs to network ${data.network}, this run targets ${networkName}. Refusing to mix releases; set POT_FORCE_FRESH_RELEASE=1 only after a deliberate review (it archives the old record).`
@@ -468,9 +595,14 @@ async function runRelease({
         );
       }
       record = data;
+      // Validate the persisted release plan structurally before using it.
+      if (record.releasePlan) {
+        validateReleasePlan(record.releasePlan);
+      }
       if (forceFresh) {
         archived.push(recordIo.archive(recordFile));
-        record = newRecord({ config, networkName, chainId });
+        const releasePlan = buildReleasePlan({ config, networkName, chainId });
+        record = newRecord({ config, networkName, chainId, releasePlan });
         stderr.write(`fresh release: explicit fresh deployment archived the existing record, starting clean\n`);
       }
     }
@@ -692,4 +824,6 @@ module.exports = {
   loadArtifact,
   runRelease,
   BINDING_TOTAL,
+  assertReleasePlanMatchesEnv,
+  validateReleasePlan,
 };

@@ -159,6 +159,24 @@ const existingRecord = {
     erc721: { address: TOKEN_ERC721, name: 'Portaldot Pot Collectibles', symbol: 'POTC' },
   },
   bindings: [],
+  releasePlan: {
+    version: 1,
+    network: NETWORK,
+    chainId: CHAIN_ID,
+    deployer: DEPLOYER,
+    tokenConfig: {
+      erc20Name: 'Portaldot Pot Token',
+      erc20Symbol: 'POT',
+      erc721Name: 'Portaldot Pot Collectibles',
+      erc721Symbol: 'POTC',
+    },
+    nativeObjects: [
+      { kind: 'asset', id: 1 },
+      { kind: 'nft_collection', id: 2 },
+    ],
+    nativeAccountHash: COMMITMENT,
+    commitmentSource: 'derived',
+  },
 };
 
 function probeEnv() {
@@ -711,6 +729,8 @@ function recordWithPlan(tokenConfigOverrides = {}, nativeObjectsOverrides = []) 
   const r = JSON.parse(JSON.stringify(existingRecord));
   r.releasePlan = {
     version: RELEASE_PLAN_VERSION,
+    network: NETWORK,
+    chainId: CHAIN_ID,
     deployer: DEPLOYER,
     tokenConfig: {
       erc20Name: tokenConfigOverrides.erc20Name ?? 'Custom Token',
@@ -887,6 +907,8 @@ function verifiedRecordWithEntry(entry) {
   r.tokens = { erc20: { address: entry.address, name: 'Custom Token', symbol: 'CUSTOM', decimals: 18 } };
   r.releasePlan = {
     version: RELEASE_PLAN_VERSION,
+    network: NETWORK,
+    chainId: CHAIN_ID,
     deployer: DEPLOYER,
     tokenConfig: { erc20Name: 'Custom Token', erc20Symbol: 'CUSTOM', erc721Name: 'Custom Collectibles', erc721Symbol: 'CUSTC' },
     nativeObjects: [{ kind: 'asset', id: 1 }, { kind: 'nft_collection', id: 2 }],
@@ -1466,3 +1488,501 @@ test('Objective B: receipt success followed by persistence failure aborts withou
 });
 
 
+// ------------------------------------------------------------
+// 7. Objective A: Fresh release-plan persistence
+// ------------------------------------------------------------
+
+test('Objective A: fresh release persists complete plan before first broadcast', async () => {
+  const recordFile = tempFile();
+  const recordIo = makeRecordIo(null);
+  const probes = makeProbes({
+    evmBalance: 10_000n * 10n ** 18n,
+    nativeFree: 10_000n * 10n ** 14n,
+    codes: {
+      [TOKEN_ERC20]: `0x${'ff'.repeat(200)}`,
+      [TOKEN_ERC721]: `0x${'ff'.repeat(200)}`,
+      [REGISTRY_ADDR]: `0x${'ff'.repeat(200)}`,
+    },
+    receipts: {
+      [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
+      [`0x${'bb'.repeat(32)}`]: { status: 1, blockNumber: 2, transactionHash: `0x${'bb'.repeat(32)}`, contractAddress: TOKEN_ERC721 },
+      [`0x${'cc'.repeat(32)}`]: { status: 1, blockNumber: 3, transactionHash: `0x${'cc'.repeat(32)}`, contractAddress: REGISTRY_ADDR },
+    },
+  });
+  let planSeenBeforeBroadcast = null;
+  let sent = 0;
+  const deployContract = async (artifact, gasLimit, hooks) => {
+    // Capture the plan (record state) before broadcasting this artifact
+    const currentState = recordIo.state();
+    if (planSeenBeforeBroadcast === null) {
+      planSeenBeforeBroadcast = currentState;
+    }
+    sent += 1;
+    const txHash = mockTxHash('dd' + sent);
+    hooks.onSent(txHash);
+    const receipt = { status: 1, blockNumber: 10 + sent, transactionHash: txHash, contractAddress: RELEASE_ADDRESS(artifact.name) };
+    if (hooks.onReceipt) hooks.onReceipt(receipt);
+    return deployResult(artifact.name, txHash, receipt);
+  };
+
+  const result = await runRelease({
+    env: {
+      ...probeEnv(),
+      POT_ERC20_NAME: 'Fresh Token',
+      POT_ERC20_SYMBOL: 'FRES',
+      POT_ERC721_NAME: 'Fresh Collectibles',
+      POT_ERC721_SYMBOL: 'FRSC',
+    },
+    deployerAddress: DEPLOYER,
+    recordIo,
+    probes,
+    deployContract,
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+  });
+  assert.equal(result.sentCount, 3, 'all three contracts deployed');
+
+  // The plan must have been persisted before the first broadcast
+  const final = recordIo.state();
+  assert.ok(final.releasePlan, 'release plan must be persisted in the record');
+  assert.equal(final.releasePlan.version, 1, 'plan schema version must be 1');
+  assert.equal(final.releasePlan.network, NETWORK, 'plan network must match');
+  assert.equal(final.releasePlan.chainId, CHAIN_ID, 'plan chainId must match');
+  assert.equal(final.releasePlan.deployer, DEPLOYER, 'plan deployer must match');
+  assert.equal(final.releasePlan.tokenConfig.erc20Name, 'Fresh Token', 'plan erc20 name must match env');
+  assert.equal(final.releasePlan.tokenConfig.erc20Symbol, 'FRES', 'plan erc20 symbol must match env');
+  assert.equal(final.releasePlan.tokenConfig.erc721Name, 'Fresh Collectibles', 'plan erc721 name must match env');
+  assert.equal(final.releasePlan.tokenConfig.erc721Symbol, 'FRSC', 'plan erc721 symbol must match env');
+  assert.equal(final.releasePlan.nativeObjects[0].kind, 'asset', 'plan nativeObjects must include asset');
+  assert.equal(final.releasePlan.nativeObjects[0].id, 1, 'plan asset id must match env');
+  assert.equal(final.releasePlan.nativeObjects[1].kind, 'nft_collection', 'plan nativeObjects must include nft_collection');
+  assert.equal(final.releasePlan.nativeObjects[1].id, 2, 'plan nft id must match env');
+  assert.equal(final.releasePlan.nativeAccountHash, COMMITMENT, 'plan nativeAccountHash must match commitment');
+  assert.equal(final.releasePlan.commitmentSource, 'derived', 'plan commitmentSource must be derived');
+
+  // Verify the plan was present before the first broadcast
+  assert.ok(planSeenBeforeBroadcast.releasePlan, 'plan must be present in record before first broadcast');
+  assert.equal(planSeenBeforeBroadcast.releasePlan.tokenConfig.erc20Name, 'Fresh Token', 'plan erc20 name must be present before first broadcast');
+});
+
+// ------------------------------------------------------------
+// 8. Objective B: Validate exact configuration across both stages
+// ------------------------------------------------------------
+
+function planMismatchHarness(planOverrides = {}, envOverrides = {}, expectErrorPattern) {
+  return async () => {
+    const recordFile = tempFile();
+    const basePlan = {
+      version: 1,
+      network: NETWORK,
+      chainId: CHAIN_ID,
+      deployer: DEPLOYER,
+      tokenConfig: {
+        erc20Name: 'Portaldot Pot Token',
+        erc20Symbol: 'POT',
+        erc721Name: 'Portaldot Pot Collectibles',
+        erc721Symbol: 'POTC',
+      },
+      nativeObjects: [
+        { kind: 'asset', id: 1 },
+        { kind: 'nft_collection', id: 2 },
+      ],
+      nativeAccountHash: COMMITMENT,
+      commitmentSource: 'derived',
+    };
+    const plan = { ...basePlan, ...planOverrides };
+    const record = {
+      ...existingRecord,
+      releasePlan: plan,
+    };
+    const recordIo = makeRecordIo(record);
+    const probes = makeProbes({
+      evmBalance: 10_000n * 10n ** 18n,
+      nativeFree: 10_000n * 10n ** 14n,
+      codes: {
+        [TOKEN_ERC20]: `0x${'ff'.repeat(200)}`,
+      },
+      receipts: {
+        [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
+      },
+    });
+    let sent = 0;
+    const deployContract = async () => { sent += 1; return deployResult('PotERC20', `0x${'ee'.repeat(32)}`); };
+    const env = { ...probeEnv(), ...envOverrides };
+    await assert.rejects(() => runRelease({
+      env,
+      deployerAddress: DEPLOYER,
+      recordIo,
+      probes,
+      deployContract,
+      recordFile,
+      networkName: NETWORK,
+      chainId: CHAIN_ID,
+    }), expectErrorPattern);
+    assert.equal(sent, 0, 'no deployment may proceed when configuration conflicts with frozen plan');
+  };
+}
+
+test('Objective B: changed native asset ID aborts before signing', async () => {
+  await planMismatchHarness(
+    { nativeObjects: [{ kind: 'asset', id: 999 }, { kind: 'nft_collection', id: 2 }] },
+    {},
+    /native asset id.*999.*but the environment configures 1|refusing to drift/
+  );
+});
+
+test('Objective B: changed NFT collection ID aborts before signing', async () => {
+  await planMismatchHarness(
+    { nativeObjects: [{ kind: 'asset', id: 1 }, { kind: 'nft_collection', id: 999 }] },
+    {},
+    /native nft_collection id.*999.*but the environment configures 2|refusing to drift/
+  );
+});
+
+test('Objective B: changed native account hash aborts before signing', async () => {
+  await planMismatchHarness(
+    { nativeAccountHash: `0x${'ff'.repeat(32)}` },
+    {},
+    /native account commitment conflicts/
+  );
+});
+
+test('Objective B: different release-plan deployer aborts before signing', async () => {
+  const recordFile = tempFile();
+  const record = {
+    ...existingRecord,
+    deployer: `0x${'99'.repeat(20)}`,
+    releasePlan: {
+      version: 1,
+      network: NETWORK,
+      chainId: CHAIN_ID,
+      deployer: `0x${'99'.repeat(20)}`,
+      tokenConfig: {
+        erc20Name: 'Portaldot Pot Token',
+        erc20Symbol: 'POT',
+        erc721Name: 'Portaldot Pot Collectibles',
+        erc721Symbol: 'POTC',
+      },
+      nativeObjects: [
+        { kind: 'asset', id: 1 },
+        { kind: 'nft_collection', id: 2 },
+      ],
+      nativeAccountHash: COMMITMENT,
+      commitmentSource: 'derived',
+    },
+  };
+  const recordIo = makeRecordIo(record);
+  const probes = makeProbes({
+    evmBalance: 10_000n * 10n ** 18n,
+    nativeFree: 10_000n * 10n ** 14n,
+    codes: {
+      [TOKEN_ERC20]: `0x${'ff'.repeat(200)}`,
+    },
+    receipts: {
+      [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
+    },
+  });
+  let sent = 0;
+  const deployContract = async () => { sent += 1; return deployResult('PotERC20', `0x${'ee'.repeat(32)}`); };
+  await assert.rejects(() => runRelease({
+    env: probeEnv(),
+    deployerAddress: DEPLOYER,
+    recordIo,
+    probes,
+    deployContract,
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+  }), /different deployer/);
+  assert.equal(sent, 0, 'no deployment may proceed when deployer conflicts with plan');
+});
+
+test('Objective B: network mismatch aborts before signing', async () => {
+  const recordFile = tempFile();
+  const record = {
+    ...existingRecord,
+    network: 'otherNetwork',
+    releasePlan: {
+      ...existingRecord.releasePlan,
+      network: 'otherNetwork',
+    },
+  };
+  const recordIo = makeRecordIo(record);
+  const probes = makeProbes({
+    evmBalance: 10_000n * 10n ** 18n,
+    nativeFree: 10_000n * 10n ** 14n,
+    codes: {
+      [TOKEN_ERC20]: `0x${'ff'.repeat(200)}`,
+    },
+    receipts: {
+      [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
+    },
+  });
+  let sent = 0;
+  const deployContract = async () => { sent += 1; return deployResult('PotERC20', `0x${'ee'.repeat(32)}`); };
+  await assert.rejects(() => runRelease({
+    env: probeEnv(),
+    deployerAddress: DEPLOYER,
+    recordIo,
+    probes,
+    deployContract,
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+  }), /belongs to network/);
+  assert.equal(sent, 0, 'no deployment may proceed when network conflicts with plan');
+});
+
+test('Objective B: chainId mismatch aborts before signing', async () => {
+  const recordFile = tempFile();
+  // Record chainId is correct, but releasePlan chainId differs
+  const record = {
+    ...existingRecord,
+    releasePlan: {
+      ...existingRecord.releasePlan,
+      chainId: 1,
+    },
+  };
+  const recordIo = makeRecordIo(record);
+  const probes = makeProbes({
+    evmBalance: 10_000n * 10n ** 18n,
+    nativeFree: 10_000n * 10n ** 14n,
+    codes: {
+      [TOKEN_ERC20]: `0x${'ff'.repeat(200)}`,
+    },
+    receipts: {
+      [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
+    },
+  });
+  let sent = 0;
+  const deployContract = async () => { sent += 1; return deployResult('PotERC20', `0x${'ee'.repeat(32)}`); };
+  await assert.rejects(() => runRelease({
+    env: probeEnv(),
+    deployerAddress: DEPLOYER,
+    recordIo,
+    probes,
+    deployContract,
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+  }), /release plan chainId/);
+  assert.equal(sent, 0, 'no deployment may proceed when chainId conflicts with plan');
+});
+
+test('Objective B: token metadata drift aborts before signing', async () => {
+  await planMismatchHarness(
+    {},
+    { POT_ERC20_NAME: 'Different Token' },
+    /release plan.*erc20Name.*conflicts/
+  );
+});
+
+test('Objective B: binding attempt with conflicting config aborts before signing', async () => {
+  // A binding attempt where env native IDs conflict with the frozen plan
+  const recordFile = tempFile();
+  const record = {
+    ...existingRecord,
+    bindings: [],
+  };
+  const recordIo = makeRecordIo(record);
+  const probes = makeProbes({
+    evmBalance: 10_000n * 10n ** 18n,
+    nativeFree: 10_000n * 10n ** 14n,
+    codes: {
+      [TOKEN_ERC20]: `0x${'ff'.repeat(200)}`,
+      [TOKEN_ERC721]: `0x${'ff'.repeat(200)}`,
+      [REGISTRY_ADDR]: `0x${'ff'.repeat(200)}`,
+    },
+    receipts: {
+      [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
+      [`0x${'bb'.repeat(32)}`]: { status: 1, blockNumber: 2, transactionHash: `0x${'bb'.repeat(32)}`, contractAddress: TOKEN_ERC721 },
+      [`0x${'cc'.repeat(32)}`]: { status: 1, blockNumber: 3, transactionHash: `0x${'cc'.repeat(32)}`, contractAddress: REGISTRY_ADDR },
+    },
+  });
+  let sent = 0;
+  const bindSender = async (params, hooks) => {
+    sent += 1;
+    const txHash = mockTxHash('bb' + sent);
+    if (hooks.onSent) hooks.onSent(txHash);
+    return { hash: txHash, wait: async () => ({ status: 1, blockNumber: 77, transactionHash: txHash }) };
+  };
+  const registryViews = {
+    isBound: async () => false,
+    bindingOfToken: async () => null,
+    bindingCount: async () => 0,
+  };
+  const encodeBind = () => '0xbind';
+  const env = {
+    ...probeEnv(),
+    POT_NATIVE_ASSET_ID: '999', // conflicts with plan's asset id 1
+  };
+  await assert.rejects(() => runBinding({
+    env,
+    recordIo,
+    probes,
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+    signerAddress: DEPLOYER,
+    registryViews,
+    bindSender,
+    encodeBind,
+    registryAddress: REGISTRY_ADDR,
+    tokenAddresses: { erc20: TOKEN_ERC20, erc721: TOKEN_ERC721 },
+  }), /native asset id 1 but the environment configures 999/);
+  assert.equal(sent, 0, 'no binding transaction may proceed when config conflicts with frozen plan');
+});
+
+// ------------------------------------------------------------
+// 9. Objective C: Additional pending deployment receipt reconciliation tests
+// ------------------------------------------------------------
+
+test('Objective C: receipt missing contractAddress aborts even when record has address', async () => {
+  const recordFile = tempFile();
+  const recordIo = makeRecordIo(verifiedRecordWithEntry({
+    address: TOKEN_ERC20,
+    txHash: `0x${'aa'.repeat(32)}`,
+    blockNumber: 1,
+    status: 'confirmed',
+  }));
+  const probes = makeProbes({
+    evmBalance: 10_000n * 10n ** 18n,
+    nativeFree: 10_000n * 10n ** 14n,
+    codes: { [TOKEN_ERC20]: `0x${'ff'.repeat(200)}` },
+    receipts: {
+      // Receipt has no contractAddress field
+      [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}` },
+    },
+  });
+  let sent = 0;
+  const deployContract = async () => { sent += 1; return deployResult('PotERC20', `0x${'ee'.repeat(32)}`); };
+  await assert.rejects(() => runRelease({
+    env: {
+      ...probeEnv(),
+      POT_ERC20_NAME: 'Custom Token',
+      POT_ERC20_SYMBOL: 'CUSTOM',
+      POT_ERC721_NAME: 'Custom Collectibles',
+      POT_ERC721_SYMBOL: 'CUSTC',
+    },
+    deployerAddress: DEPLOYER,
+    recordIo,
+    probes,
+    deployContract,
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+  }), /contract-creation address/);
+  assert.equal(sent, 0, 'no deployment may proceed when receipt lacks contractAddress');
+});
+
+test('Objective C: receipt contractAddress malformed aborts', async () => {
+  const recordFile = tempFile();
+  const recordIo = makeRecordIo(verifiedRecordWithEntry({
+    address: TOKEN_ERC20,
+    txHash: `0x${'aa'.repeat(32)}`,
+    blockNumber: 1,
+    status: 'confirmed',
+  }));
+  const probes = makeProbes({
+    evmBalance: 10_000n * 10n ** 18n,
+    nativeFree: 10_000n * 10n ** 14n,
+    codes: { [TOKEN_ERC20]: `0x${'ff'.repeat(200)}` },
+    receipts: {
+      [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: 'not-an-address' },
+    },
+  });
+  let sent = 0;
+  const deployContract = async () => { sent += 1; return deployResult('PotERC20', `0x${'ee'.repeat(32)}`); };
+  await assert.rejects(() => runRelease({
+    env: {
+      ...probeEnv(),
+      POT_ERC20_NAME: 'Custom Token',
+      POT_ERC20_SYMBOL: 'CUSTOM',
+      POT_ERC721_NAME: 'Custom Collectibles',
+      POT_ERC721_SYMBOL: 'CUSTC',
+    },
+    deployerAddress: DEPLOYER,
+    recordIo,
+    probes,
+    deployContract,
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+  }), /contract-creation address/);
+  assert.equal(sent, 0, 'no deployment may proceed when receipt contractAddress is malformed');
+});
+
+test('Objective C: receipt address different from recorded address aborts', async () => {
+  const recordFile = tempFile();
+  const recordIo = makeRecordIo(verifiedRecordWithEntry({
+    address: TOKEN_ERC20,
+    txHash: `0x${'aa'.repeat(32)}`,
+    blockNumber: 1,
+    status: 'confirmed',
+  }));
+  const probes = makeProbes({
+    evmBalance: 10_000n * 10n ** 18n,
+    nativeFree: 10_000n * 10n ** 14n,
+    codes: { [TOKEN_ERC20]: `0x${'ff'.repeat(200)}` },
+    receipts: {
+      [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC721 },
+    },
+  });
+  let sent = 0;
+  const deployContract = async () => { sent += 1; return deployResult('PotERC20', `0x${'ee'.repeat(32)}`); };
+  await assert.rejects(() => runRelease({
+    env: {
+      ...probeEnv(),
+      POT_ERC20_NAME: 'Custom Token',
+      POT_ERC20_SYMBOL: 'CUSTOM',
+      POT_ERC721_NAME: 'Custom Collectibles',
+      POT_ERC721_SYMBOL: 'CUSTC',
+    },
+    deployerAddress: DEPLOYER,
+    recordIo,
+    probes,
+    deployContract,
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+  }), /does not match the recorded address/);
+  assert.equal(sent, 0, 'no deployment may proceed when receipt address differs from journaled address');
+});
+
+test('Objective C: missing block number aborts reconciliation', async () => {
+  const recordFile = tempFile();
+  const recordIo = makeRecordIo(verifiedRecordWithEntry({
+    address: TOKEN_ERC20,
+    txHash: `0x${'aa'.repeat(32)}`,
+    blockNumber: 1,
+    status: 'confirmed',
+  }));
+  const probes = makeProbes({
+    evmBalance: 10_000n * 10n ** 18n,
+    nativeFree: 10_000n * 10n ** 14n,
+    codes: { [TOKEN_ERC20]: `0x${'ff'.repeat(200)}` },
+    receipts: {
+      [`0x${'aa'.repeat(32)}`]: { status: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
+    },
+  });
+  let sent = 0;
+  const deployContract = async () => { sent += 1; return deployResult('PotERC20', `0x${'ee'.repeat(32)}`); };
+  await assert.rejects(() => runRelease({
+    env: {
+      ...probeEnv(),
+      POT_ERC20_NAME: 'Custom Token',
+      POT_ERC20_SYMBOL: 'CUSTOM',
+      POT_ERC721_NAME: 'Custom Collectibles',
+      POT_ERC721_SYMBOL: 'CUSTC',
+    },
+    deployerAddress: DEPLOYER,
+    recordIo,
+    probes,
+    deployContract,
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+  }), /invalid block number/);
+  assert.equal(sent, 0, 'no deployment may proceed when receipt block number is invalid');
+});
