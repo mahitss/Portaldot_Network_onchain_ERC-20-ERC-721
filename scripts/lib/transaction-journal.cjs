@@ -139,17 +139,50 @@ function persistPendingEntry(recordFile, entry) {
   const directory = path.dirname(recordFile);
   fs.mkdirSync(directory, { recursive: true });
   const journalPath = `${recordFile}.journal`;
+
+  // Exclusive creation: fail if an unresolved journal already exists.
+  if (fs.existsSync(journalPath)) {
+    const existing = readPendingJournal(recordFile);
+    if (existing.status === 'ok' && existing.entry &&
+        existing.entry.txHash === entry.txHash &&
+        existing.entry.operation === entry.operation) {
+      // Same operation — idempotent, allow.
+    } else {
+      throw new Error(
+        `cannot persist journal: an unresolved journal already exists at ${journalPath}. ` +
+          'Refusing to overwrite. Resolve the existing journal first.'
+      );
+    }
+  }
+
   const tmp = `${journalPath}.tmp-${process.pid}-${Date.now()}`;
   fs.writeFileSync(tmp, `${JSON.stringify(entry, null, 2)}\n`, { mode: FILE_MODE });
+  try {
+    fs.chmodSync(tmp, FILE_MODE);
+  } catch {
+    // best-effort
+  }
+  try {
+    const fd = fs.openSync(tmp, 'r+');
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+  } catch {
+    // best-effort
+  }
   try {
     fs.renameSync(tmp, journalPath);
   } catch (error) {
     try {
       fs.unlinkSync(tmp);
     } catch {
-      // best-effort cleanup; original journal is intact
+      // best-effort cleanup
     }
     throw new Error(`atomic journal write failed for ${journalPath}: ${error.message}`);
+  }
+  try {
+    fs.chmodSync(journalPath, FILE_MODE);
+  } catch {
+    // best-effort
   }
   return journalPath;
 }
@@ -170,12 +203,25 @@ function readPendingJournal(recordFile) {
 }
 
 // Remove the journal entry after a transaction has been confirmed and the
-// deployment record has been updated. Best-effort: a missing file is not
-// an error.
-function clearPendingJournal(recordFile) {
+// deployment record has been updated. Requires matching operation ID and
+// txHash to prevent deleting a different journal.
+function clearPendingJournal(recordFile, expectedOpId, expectedTxHash) {
   const journalPath = `${recordFile}.journal`;
   if (!fs.existsSync(journalPath)) {
-    return;
+    return; // already cleared
+  }
+  const existing = readPendingJournal(recordFile);
+  if (existing.status === 'ok' && existing.entry) {
+    if (expectedOpId && existing.entry.operationId && existing.entry.operationId !== expectedOpId) {
+      throw new Error(
+        `refusing to clear journal: operation ID mismatch (expected ${expectedOpId}, found ${existing.entry.operationId})`
+      );
+    }
+    if (expectedTxHash && existing.entry.txHash && existing.entry.txHash !== expectedTxHash) {
+      throw new Error(
+        `refusing to clear journal: txHash mismatch (expected ${expectedTxHash}, found ${existing.entry.txHash})`
+      );
+    }
   }
   try {
     fs.unlinkSync(journalPath);
