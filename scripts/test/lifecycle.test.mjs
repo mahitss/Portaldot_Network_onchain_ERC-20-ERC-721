@@ -79,6 +79,21 @@ function makeProbes(opts = {}) {
     calls = [],              // recorded probe call names
   } = opts;
 
+  // Default receipts for the standard confirmed contracts in existingRecord
+  const defaultReceipts = {
+    [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
+    [`0x${'bb'.repeat(32)}`]: { status: 1, blockNumber: 2, transactionHash: `0x${'bb'.repeat(32)}`, contractAddress: TOKEN_ERC721 },
+    [`0x${'cc'.repeat(32)}`]: { status: 1, blockNumber: 3, transactionHash: `0x${'cc'.repeat(32)}`, contractAddress: REGISTRY_ADDR },
+  };
+  const defaultCodes = {
+    [TOKEN_ERC20]: `0x${'ff'.repeat(200)}`,
+    [TOKEN_ERC721]: `0x${'ff'.repeat(200)}`,
+    [REGISTRY_ADDR]: `0x${'ff'.repeat(200)}`,
+  };
+
+  const mergedReceipts = { ...defaultReceipts, ...receipts };
+  const mergedCodes = { ...defaultCodes, ...codes };
+
   return {
     chainId: record(calls, 'chainId', async () => chainId),
     evmBalance: record(calls, 'evmBalance', async () => evmBalance),
@@ -90,8 +105,9 @@ function makeProbes(opts = {}) {
       return estimate;
     }),
     estimateCall: record(calls, 'estimateCall', async ({ to }) => bindEstimate),
-    code: record(calls, 'code', async (address) => codes[address] ?? '0x'),
-    receipt: record(calls, 'receipt', async (txHash) => receipts[txHash] ?? null),
+    code: record(calls, 'code', async (address) => mergedCodes[address] ?? '0x'),
+    receipt: record(calls, 'receipt', async (txHash) => mergedReceipts[txHash] ?? null),
+    deploymentReceipt: record(calls, 'deploymentReceipt', async (txHash) => defaultReceipts[txHash] ?? null),
     transaction: record(calls, 'transaction', async (txHash) => txs[txHash] ?? null),
     nativeFreeBalance: record(calls, 'nativeFreeBalance', async () => nativeFree),
     nativeObject: record(calls, 'nativeObject', async (kind, id) => {
@@ -435,7 +451,7 @@ test('ambiguous pending outcome: no receipt on chain aborts fail-closed instead 
   };
   afterCrash.tokens = {};
   const recordIo = makeRecordIo(afterCrash);
-  const probes = makeProbes({ evmBalance: 10_000n * 10n ** 18n, nativeFree: 10_000n * 10n ** 14n });
+  const probes = makeProbes({ evmBalance: 10_000n * 10n ** 18n, nativeFree: 10_000n * 10n ** 14n, receipts: { [`0x${'aa'.repeat(32)}`]: null } });
   // receipts: none -> ambiguous
   let sent = 0;
   const deployContract = async () => { sent += 1; return deployResult('PotERC20', `0x${'ee'.repeat(32)}`); };
@@ -544,6 +560,14 @@ function bindProbes(opts = {}) {
     codes = {},
     calls = [],
   } = opts;
+  const defaultReceipts = {
+    [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
+    [`0x${'bb'.repeat(32)}`]: { status: 1, blockNumber: 2, transactionHash: `0x${'bb'.repeat(32)}`, contractAddress: TOKEN_ERC721 },
+    [`0x${'cc'.repeat(32)}`]: { status: 1, blockNumber: 3, transactionHash: `0x${'cc'.repeat(32)}`, contractAddress: REGISTRY_ADDR },
+  };
+  // Default deployment receipts take priority over pendingReceipts for standard
+  // txHashes so deployment verification is not affected by binding receipts.
+  const mergedReceipts = { ...pendingReceipts, ...defaultReceipts };
   return {
     chainId: record(calls, 'chainId', async () => CHAIN_ID),
     evmBalance: record(calls, 'evmBalance', async () => evmBalance),
@@ -552,6 +576,7 @@ function bindProbes(opts = {}) {
     estimateCall: record(calls, 'estimateCall', async () => 1_000_000_000_000_000n),
     code: record(calls, 'code', async (address) => codes[address] ?? `0x${'ff'.repeat(300)}`),
     receipt: record(calls, 'receipt', async (txHash) => pendingReceipts[txHash] ?? null),
+    deploymentReceipt: record(calls, 'deploymentReceipt', async (txHash) => defaultReceipts[txHash] ?? null),
     nativeFreeBalance: record(calls, 'nativeFreeBalance', async () => nativeFree),
     nativeObject: record(calls, 'nativeObject', async (kind, id) => {
       return { kind, id, exists: true, details: 'fake' };
@@ -702,7 +727,7 @@ test('binding: ambiguous pending binding (no receipt) aborts fail-closed without
       { token: TOKEN_ERC20, tokenKind: 0, nativeKind: 1, nativeId: 1, nativeDecimals: 14, evmDecimals: 18, conversionFactor: '10000', nativeAccountHash: COMMITMENT, active: true, txHash: `0x${'aa'.repeat(32)}`, status: 'pending' },
     ],
   });
-  await assert.rejects(() => bindingHarness(rec, { boundAlready: { [TOKEN_ERC721.toLowerCase()]: false } }), /ambiguous/);
+  await assert.rejects(() => bindingHarness(rec, { boundAlready: { [TOKEN_ERC721.toLowerCase()]: false }, pendingReceipts: { [`0x${'aa'.repeat(32)}`]: null } }), /ambiguous/);
 });
 
 test('binding: missing deployment record aborts; binding never releases into a void', async () => {
@@ -930,6 +955,7 @@ test('Objective C: confirmed entry with no receipt on chain aborts before reuse'
     evmBalance: 10_000n * 10n ** 18n,
     nativeFree: 10_000n * 10n ** 14n,
     codes: { [TOKEN_ERC20]: `0x${'ff'.repeat(200)}` },
+    receipts: { [`0x${'aa'.repeat(32)}`]: null },
     // No receipts → ambiguous
   });
   let sent = 0;
@@ -1042,6 +1068,7 @@ test('Objective C: confirmed entry with missing bytecode aborts before reuse', a
   const probes = makeProbes({
     evmBalance: 10_000n * 10n ** 18n,
     nativeFree: 10_000n * 10n ** 14n,
+    codes: { [TOKEN_ERC20]: '0x' },
     // No codes → returns '0x' (no bytecode)
     receipts: {
       [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
@@ -1191,12 +1218,28 @@ function journalingDeployContract(opts = {}) {
   };
 }
 
-test('Objective B: crash before broadcast - journaled pending entry reconciled on retry, no duplicate', async () => {
+test('Objective B: crash before broadcast - journaled pending entry rebroadcast on retry, no duplicate', async () => {
   const recordFile = tempFile();
   const recordIo = makeRecordIo(null);
   const txHash = mockTxHash('jj1');
-  // First run: journal pending then crash before broadcast
-  const crashingDeploy = journalingDeployContract({ shouldThrowAfterOnSent: true });
+  const signedTx = `0x${'aa'.repeat(64)}`;
+  let journalEntry = null;
+  // deployContract: journal pending + signed tx, then crash before broadcast
+  const crashingDeploy = async (artifact, gasLimit, hooks) => {
+    // Simulate journal write success, then crash before broadcast
+    journalEntry = {
+      operation: 'deploy',
+      contract: artifact.name,
+      txHash,
+      signed: signedTx,
+      params: { artifact: artifact.name, gasLimit: gasLimit.toString(), args: artifact.args },
+      createdAt: new Date().toISOString(),
+      attempts: 1,
+      status: 'pending',
+    };
+    hooks.onSent(txHash, signedTx);
+    throw new Error('crash after journaling, before broadcast');
+  };
   let sent1 = 0;
   const deploy1 = async (artifact, gasLimit, hooks) => {
     sent1 += 1;
@@ -1207,7 +1250,6 @@ test('Objective B: crash before broadcast - journaled pending entry reconciled o
     evmBalance: 10_000n * 10n ** 18n,
     nativeFree: 10_000n * 10n ** 14n,
   });
-  // env with custom names matching plan
   const planEnv = {
     ...probeEnv(),
     POT_ERC20_NAME: 'Custom Token',
@@ -1216,7 +1258,7 @@ test('Objective B: crash before broadcast - journaled pending entry reconciled o
     POT_ERC721_SYMBOL: 'CUSTC',
   };
 
-  // First run crashes after journaling PotERC20
+  // First run crashes after journaling PotERC20, before broadcast
   await assert.rejects(() => runRelease({
     env: planEnv,
     deployerAddress: DEPLOYER,
@@ -1231,8 +1273,9 @@ test('Objective B: crash before broadcast - journaled pending entry reconciled o
   const afterCrash = recordIo.state();
   assert.equal(afterCrash.contracts.PotERC20.status, 'pending', 'pending entry journaled before broadcast');
   assert.equal(afterCrash.contracts.PotERC20.txHash, txHash, 'journaled txHash recorded');
+  assert.equal(afterCrash.contracts.PotERC20.signed, signedTx, 'signed raw bytes journaled');
 
-  // Second run: receipt now available on chain → reconcile, no redeploy
+  // Second run: rebroadcast the exact same signed tx, reconcile with receipt
   const probes2 = makeProbes({
     evmBalance: 10_000n * 10n ** 18n,
     nativeFree: 10_000n * 10n ** 14n,
@@ -1247,12 +1290,19 @@ test('Objective B: crash before broadcast - journaled pending entry reconciled o
   });
   let sent2 = 0;
   const deploy2 = async (artifact, gasLimit, hooks) => {
+    // This deployContract is only for outstanding contracts (PotERC721, PotRegistry)
     sent2 += 1;
     const h = mockTxHash('jj2' + sent2);
     const r = { status: 1, blockNumber: 50 + sent2, transactionHash: h, contractAddress: RELEASE_ADDRESS(artifact.name) };
     if (hooks.onSent) hooks.onSent(h);
     if (hooks.onReceipt) hooks.onReceipt(r);
     return { txHash: h, receipt: r, address: r.contractAddress };
+  };
+
+  const rebroadcastTx = async (signed) => {
+    assert.equal(signed, signedTx, 'rebroadcast uses the exact same signed bytes');
+    const receipt = { status: 1, blockNumber: 42, transactionHash: txHash, contractAddress: TOKEN_ERC20 };
+    return { receipt, address: TOKEN_ERC20 };
   };
 
   const result = await runRelease({
@@ -1264,23 +1314,119 @@ test('Objective B: crash before broadcast - journaled pending entry reconciled o
     recordFile,
     networkName: NETWORK,
     chainId: CHAIN_ID,
+    rebroadcastTx,
   });
-  assert.equal(sent2, 2, 'only PotERC721 and PotRegistry deployed (PotERC20 reconciled)');
+  assert.equal(sent2, 2, 'only PotERC721 and PotRegistry deployed (PotERC20 rebroadcast from journal, not redeployed)');
   const final = recordIo.state();
   assert.equal(final.contracts.PotERC20.status, 'confirmed');
-  assert.equal(final.contracts.PotERC20.txHash, txHash, 'reconciled from journaled txHash, not redeployed');
+  assert.equal(final.contracts.PotERC20.txHash, txHash, 'same txHash reused from journal, not redeployed');
   assert.equal(final.contracts.PotERC20.blockNumber, 42);
 });
 
-test('Objective B: crash after broadcast - pending entry persists, retry reconciles without duplicate broadcast', async () => {
+test('Objective B: crash before journaling - no broadcast attempted', async () => {
   const recordFile = tempFile();
   const recordIo = makeRecordIo(null);
-  const txHash = mockTxHash('jj1');
-  // deployContract: journal pending (onSent), then throw after broadcast
-  const crashingDeploy = journalingDeployContract({ shouldThrowAfterBroadcast: true });
+  const probes = makeProbes({
+    evmBalance: 10_000n * 10n ** 18n,
+    nativeFree: 10_000n * 10n ** 14n,
+  });
+  const planEnv = {
+    ...probeEnv(),
+    POT_ERC20_NAME: 'Custom Token',
+    POT_ERC20_SYMBOL: 'CUSTOM',
+    POT_ERC721_NAME: 'Custom Collectibles',
+    POT_ERC721_SYMBOL: 'CUSTC',
+  };
+  // deployContract throws BEFORE journaling (simulating crash before journal write)
+  const crashingDeploy = async (artifact, gasLimit, hooks) => {
+    throw new Error('crash before journaling');
+  };
   let sent = 0;
   const deployContract = async (artifact, gasLimit, hooks) => {
     sent += 1;
+    return crashingDeploy(artifact, gasLimit, hooks);
+  };
+
+  await assert.rejects(() => runRelease({
+    env: planEnv,
+    deployerAddress: DEPLOYER,
+    recordIo,
+    probes,
+    deployContract,
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+  }), /crash before journaling/);
+  assert.equal(sent, 1, 'deployContract called once but crashed before journaling');
+  const afterCrash = recordIo.state();
+  assert.equal(afterCrash.contracts.PotERC20, undefined, 'no pending entry written before journaling');
+});
+
+test('Objective B: journal write fails - no broadcast attempted', async () => {
+  const recordFile = tempFile();
+  let recordIo = makeRecordIo(null);
+  let journalWriteFailed = false;
+  // Faulty recordIo that fails on write (journal persistence)
+  recordIo = {
+    ...recordIo,
+    write: (file, value) => {
+      if (file.endsWith('.journal')) {
+        journalWriteFailed = true;
+        throw new Error('disk write failure on journal');
+      }
+      recordIo.store = JSON.parse(JSON.stringify(value));
+    },
+    state: () => recordIo.store,
+    archive: (file) => null,
+  };
+  recordIo.store = null;
+  const probes = makeProbes({
+    evmBalance: 10_000n * 10n ** 18n,
+    nativeFree: 10_000n * 10n ** 14n,
+  });
+  const planEnv = {
+    ...probeEnv(),
+    POT_ERC20_NAME: 'Custom Token',
+    POT_ERC20_SYMBOL: 'CUSTOM',
+    POT_ERC721_NAME: 'Custom Collectibles',
+    POT_ERC721_SYMBOL: 'CUSTC',
+  };
+  let sent = 0;
+  const deployContract = async (artifact, gasLimit, hooks) => {
+    sent += 1;
+    const txHash = mockTxHash('jj' + sent);
+    // Simulate journal write failure before broadcast
+    throw new Error('disk write failure on journal');
+  };
+
+  await assert.rejects(() => runRelease({
+    env: planEnv,
+    deployerAddress: DEPLOYER,
+    recordIo,
+    probes,
+    deployContract,
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+  }), /disk write failure on journal/);
+  assert.equal(sent, 1, 'deployContract called once but journal write failed before broadcast');
+  const afterCrash = recordIo.state();
+  assert.ok(!afterCrash.contracts || !afterCrash.contracts.PotERC20, 'no pending entry persisted after journal write failure');
+});
+
+test('Objective B: broadcast succeeds but receipt wait fails - retry uses same tx hash', async () => {
+  const recordFile = tempFile();
+  const recordIo = makeRecordIo(null);
+  const txHash = mockTxHash('jj1');
+  const signedTx = `0x${'aa'.repeat(64)}`;
+  // deployContract: journal + broadcast succeeds, but receipt wait fails
+  const crashingDeploy = async (artifact, gasLimit, hooks) => {
+    hooks.onSent(txHash, signedTx);
+    throw new Error('crash after broadcast, before receipt');
+  };
+  let sent1 = 0;
+  const deploy1 = async (artifact, gasLimit, hooks) => {
+    sent1 += 1;
     return crashingDeploy(artifact, gasLimit, hooks);
   };
 
@@ -1301,17 +1447,17 @@ test('Objective B: crash after broadcast - pending entry persists, retry reconci
     deployerAddress: DEPLOYER,
     recordIo,
     probes,
-    deployContract,
+    deployContract: deploy1,
     recordFile,
     networkName: NETWORK,
     chainId: CHAIN_ID,
   }), /crash after broadcast/);
-  assert.equal(sent, 1, 'broadcast was attempted once before crash');
+  assert.equal(sent1, 1, 'broadcast attempted once before crash');
   const afterCrash = recordIo.state();
   assert.equal(afterCrash.contracts.PotERC20.status, 'pending', 'pending entry persists after broadcast crash');
   assert.equal(afterCrash.contracts.PotERC20.txHash, txHash);
 
-  // Retry: receipt available → reconcile, no duplicate
+  // Retry: receipt now available → reconcile, no new broadcast
   const probes2 = makeProbes({
     evmBalance: 10_000n * 10n ** 18n,
     nativeFree: 10_000n * 10n ** 14n,
@@ -1325,7 +1471,20 @@ test('Objective B: crash after broadcast - pending entry persists, retry reconci
     },
   });
   let sent2 = 0;
-  const deploy2 = async () => { sent2 += 1; return deployResult('PotERC721', `0x${'ee'.repeat(32)}`); };
+  const deploy2 = async (artifact, gasLimit, hooks) => {
+    sent2 += 1;
+    const h = mockTxHash('jj2' + sent2);
+    const r = { status: 1, blockNumber: 50 + sent2, transactionHash: h, contractAddress: RELEASE_ADDRESS(artifact.name) };
+    if (hooks.onSent) hooks.onSent(h);
+    if (hooks.onReceipt) hooks.onReceipt(r);
+    return { txHash: h, receipt: r, address: r.contractAddress };
+  };
+
+  const rebroadcastTx = async (signed) => {
+    assert.equal(signed, signedTx, 'rebroadcast uses exact same signed bytes');
+    const receipt = { status: 1, blockNumber: 43, transactionHash: txHash, contractAddress: TOKEN_ERC20 };
+    return { receipt, address: TOKEN_ERC20 };
+  };
 
   const result = await runRelease({
     env: planEnv,
@@ -1336,11 +1495,13 @@ test('Objective B: crash after broadcast - pending entry persists, retry reconci
     recordFile,
     networkName: NETWORK,
     chainId: CHAIN_ID,
+    rebroadcastTx,
   });
-  assert.equal(sent2, 2, 'no duplicate broadcast for journaled transaction');
+  assert.equal(sent2, 2, 'only PotERC721 and PotRegistry deployed (PotERC20 reconciled from rebroadcast)');
   const final = recordIo.state();
   assert.equal(final.contracts.PotERC20.status, 'confirmed');
-  assert.equal(final.contracts.PotERC20.txHash, txHash, 'same txHash reused, not a new broadcast');
+  assert.equal(final.contracts.PotERC20.txHash, txHash, 'same txHash reused from journal, not redeployed');
+  assert.equal(final.contracts.PotERC20.blockNumber, 43);
 });
 
 test('Objective B: no receipt and genuinely ambiguous state aborts fail-closed', async () => {
