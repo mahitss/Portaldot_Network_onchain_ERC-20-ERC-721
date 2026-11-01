@@ -232,6 +232,33 @@ async function runBinding({
   // concurrent binding processes from signing different operations with the same nonce.
   const lock = acquireLock(recordFile);
   try {
+    // JOURNAL-FIRST: read and validate the journal before any new signing.
+    const existingJournal = readPendingJournal(recordFile);
+    if (existingJournal.status === 'ok' && existingJournal.entry) {
+      const je = existingJournal.entry;
+      const loaded = recordIo.read(recordFile);
+      if (loaded.status === 'ok' && loaded.data) {
+        const record = loaded.data;
+        let matched = false;
+        for (const entry of (record.bindings || [])) {
+          if (entry && entry.status === 'pending' && entry.txHash === je.txHash) {
+            matched = true;
+            break;
+          }
+        }
+        if (!matched) {
+          throw new Error(
+            `an unresolved transaction journal exists (txHash: ${je.txHash}) but no matching pending binding was found in the deployment record. ` +
+              'Inspect the journal file and deployment record; reconcile manually before retrying.'
+          );
+        }
+      }
+    } else if (existingJournal.status === 'malformed') {
+      throw new Error(
+        `the transaction journal at ${recordFile}.journal is malformed (${existingJournal.error}). ` +
+          'Refusing to proceed. Inspect and resolve the journal manually before retrying.'
+      );
+    }
     // 1. The record must exist and be strictly valid. Binding never creates
   //    or overwrites a record from nothing.
   const loaded = recordIo.read(recordFile);
@@ -376,6 +403,11 @@ async function runBinding({
         // Rebroadcast the exact same signed transaction instead of signing a
         // new one. This preserves the nonce and txHash, eliminating duplicate
         // transaction risk after a crash between journaling and broadcast.
+        // Validate the signed transaction before rebroadcasting.
+        const parsed = parseAndValidateSignedTx(signedTx, chainId, {
+          expectedTxHash: entry.txHash,
+          expectedTo: registryAddress,
+        });
         const broadcast = await rebroadcastTx(signedTx);
         const receipt = broadcast.receipt;
         validateReceipt(entry.txHash, receipt);

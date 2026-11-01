@@ -1221,8 +1221,12 @@ function journalingDeployContract(opts = {}) {
 test('Objective B: crash before broadcast - journaled pending entry rebroadcast on retry, no duplicate', async () => {
   const recordFile = tempFile();
   const recordIo = makeRecordIo(null);
-  const txHash = mockTxHash('jj1');
-  const signedTx = `0x${'aa'.repeat(64)}`;
+  const { ethers } = await import('ethers');
+  const wallet = ethers.Wallet.createRandom();
+  const txRequest = { data: '0x608060405234801561001057600080fd5b50', gasLimit: 100000n, chainId: CHAIN_ID, nonce: 0, maxFeePerGas: 1000n, maxPriorityFeePerGas: 100n };
+  const signedTx = await wallet.signTransaction(txRequest);
+  const parsedTx = ethers.Transaction.from(signedTx);
+  const txHash = parsedTx.hash;
   let journalEntry = null;
   // deployContract: journal pending + signed tx, then crash before broadcast
   const crashingDeploy = async (artifact, gasLimit, hooks) => {
@@ -1431,8 +1435,12 @@ test('Objective B: journal write fails - no broadcast attempted', async () => {
 test('Objective B: broadcast succeeds but receipt wait fails - retry uses same tx hash', async () => {
   const recordFile = tempFile();
   const recordIo = makeRecordIo(null);
-  const txHash = mockTxHash('jj1');
-  const signedTx = `0x${'aa'.repeat(64)}`;
+  const { ethers } = await import('ethers');
+  const wallet = ethers.Wallet.createRandom();
+  const txRequest2 = { data: '0x608060405234801561001057600080fd5b50', gasLimit: 100000n, chainId: CHAIN_ID, nonce: 0, maxFeePerGas: 1000n, maxPriorityFeePerGas: 100n };
+  const signedTx = await wallet.signTransaction(txRequest2);
+  const parsedTx2 = ethers.Transaction.from(signedTx);
+  const txHash = parsedTx2.hash;
   // deployContract: journal + broadcast succeeds, but receipt wait fails
   const crashingDeploy = async (artifact, gasLimit, hooks) => {
     hooks.onSent(txHash, signedTx);

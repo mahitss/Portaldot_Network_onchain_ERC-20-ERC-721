@@ -32,10 +32,12 @@ const { Transaction } = require('ethers');
 // Owner-only file permissions (0o600) where supported.
 const FILE_MODE = 0o600;
 
+const PORTALDOT_CHAIN_ID = 420420777;
+
 // Parse and re-validate a signed raw transaction before any rebroadcast.
 // Throws if the signed bytes are malformed or if any critical field
 // (chainId, sender/nonce, gas limit) is missing or invalid.
-function parseAndValidateSignedTx(signed, expectedChainId) {
+function parseAndValidateSignedTx(signed, expectedChainId, options = {}) {
   if (typeof signed !== 'string' || !/^0x[0-9a-fA-F]*$/.test(signed)) {
     throw new Error('signed transaction is not a valid hex string');
   }
@@ -45,20 +47,72 @@ function parseAndValidateSignedTx(signed, expectedChainId) {
   } catch (error) {
     throw new Error(`cannot parse signed transaction: ${error.message}`);
   }
-  // Validate critical fields before rebroadcasting.
-  if (parsed.chainId !== undefined && BigInt(parsed.chainId) !== BigInt(expectedChainId)) {
+  // Validate chain ID.
+  const chainId = expectedChainId || PORTALDOT_CHAIN_ID;
+  if (parsed.chainId !== undefined && BigInt(parsed.chainId) !== BigInt(chainId)) {
     throw new Error(
-      `signed transaction chainId ${parsed.chainId} does not match expected chainId ${expectedChainId}; refusing to rebroadcast`
+      `signed transaction chainId ${parsed.chainId} does not match expected chainId ${chainId}; refusing to rebroadcast`
     );
   }
+  // Validate nonce.
   if (parsed.nonce === undefined || parsed.nonce === null) {
     throw new Error('signed transaction has no nonce; refusing to rebroadcast');
   }
+  // Validate gas limit.
   if (parsed.gasLimit === undefined || parsed.gasLimit === null) {
     throw new Error('signed transaction has no gas limit; refusing to rebroadcast');
   }
+  // Validate hash.
   if (!parsed.hash || typeof parsed.hash !== 'string') {
     throw new Error('signed transaction has no derivable hash; refusing to rebroadcast');
+  }
+  // Validate signer.
+  if (options.expectedSender) {
+    if (!parsed.from || String(parsed.from).toLowerCase() !== String(options.expectedSender).toLowerCase()) {
+      throw new Error(
+        `signed transaction sender ${parsed.from} does not match expected sender ${options.expectedSender}; refusing to rebroadcast`
+      );
+    }
+  }
+  // Validate transaction hash.
+  if (options.expectedTxHash) {
+    if (String(parsed.hash).toLowerCase() !== String(options.expectedTxHash).toLowerCase()) {
+      throw new Error(
+        `signed transaction hash ${parsed.hash} does not match journaled hash ${options.expectedTxHash}; refusing to rebroadcast`
+      );
+    }
+  }
+  // Validate nonce against journaled nonce.
+  if (options.expectedNonce !== undefined && options.expectedNonce !== null) {
+    if (Number(parsed.nonce) !== Number(options.expectedNonce)) {
+      throw new Error(
+        `signed transaction nonce ${parsed.nonce} does not match journaled nonce ${options.expectedNonce}; refusing to rebroadcast`
+      );
+    }
+  }
+  // Validate destination.
+  if (options.expectedTo !== undefined) {
+    const actualTo = parsed.to ? String(parsed.to).toLowerCase() : null;
+    const expectedTo = options.expectedTo ? String(options.expectedTo).toLowerCase() : null;
+    if (actualTo !== expectedTo) {
+      throw new Error(
+        `signed transaction destination ${parsed.to} does not match expected destination ${options.expectedTo}; refusing to rebroadcast`
+      );
+    }
+  }
+  // Validate value.
+  if (options.expectedValue !== undefined) {
+    if (BigInt(parsed.value || 0) !== BigInt(options.expectedValue)) {
+      throw new Error(
+        `signed transaction value ${parsed.value} does not match expected value ${options.expectedValue}; refusing to rebroadcast`
+      );
+    }
+  }
+  // Validate data (initcode or calldata).
+  if (options.expectedData !== undefined) {
+    if (String(parsed.data || '0x').toLowerCase() !== String(options.expectedData).toLowerCase()) {
+      throw new Error('signed transaction data does not match expected operation data; refusing to rebroadcast');
+    }
   }
   return {
     txHash: parsed.hash,
