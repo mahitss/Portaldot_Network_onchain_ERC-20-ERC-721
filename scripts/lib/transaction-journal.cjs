@@ -203,13 +203,43 @@ function readPendingJournal(recordFile) {
   }
   try {
     const parsed = JSON.parse(fs.readFileSync(journalPath, 'utf8'));
-    // Validate schema version.
-    if (parsed.schemaVersion !== undefined && parsed.schemaVersion !== JOURNAL_SCHEMA_VERSION) {
-      return { status: 'malformed', entry: null, error: `unsupported schema version ${parsed.schemaVersion}` };
+    // Validate schema version (mandatory).
+    if (parsed.schemaVersion !== JOURNAL_SCHEMA_VERSION) {
+      return { status: 'malformed', entry: null, error: `missing or unsupported schema version (expected ${JOURNAL_SCHEMA_VERSION}, got ${parsed.schemaVersion})` };
     }
     // Validate required fields.
     if (!parsed.operation || !parsed.txHash || !parsed.signed || !parsed.operationId) {
       return { status: 'malformed', entry: null, error: 'journal missing required fields (operation, txHash, signed, operationId)' };
+    }
+    // Validate txHash format.
+    if (!/^0x[0-9a-fA-F]{64}$/.test(parsed.txHash)) {
+      return { status: 'malformed', entry: null, error: 'invalid transaction hash format' };
+    }
+    // Validate signed bytes.
+    if (!/^0x[0-9a-fA-F]+$/.test(parsed.signed)) {
+      return { status: 'malformed', entry: null, error: 'invalid signed transaction bytes' };
+    }
+    // Validate expected sender.
+    if (!parsed.expectedSender || !/^0x[0-9a-fA-F]{40}$/.test(parsed.expectedSender)) {
+      return { status: 'malformed', entry: null, error: 'missing or invalid expected sender' };
+    }
+    // Validate chain ID.
+    if (parsed.chainId !== 420420777) {
+      return { status: 'malformed', entry: null, error: `invalid chain ID (expected 420420777, got ${parsed.chainId})` };
+    }
+    // Validate nonce.
+    if (parsed.nonce === undefined || parsed.nonce === null) {
+      return { status: 'malformed', entry: null, error: 'missing nonce' };
+    }
+    // Validate expected destination.
+    if (parsed.expectedTo !== null && parsed.expectedTo !== undefined) {
+      if (!/^0x[0-9a-fA-F]{40}$/.test(parsed.expectedTo)) {
+        return { status: 'malformed', entry: null, error: 'invalid expected destination' };
+      }
+    }
+    // Validate operation type.
+    if (parsed.operation !== 'deploy' && parsed.operation !== 'bind') {
+      return { status: 'malformed', entry: null, error: `invalid operation type: ${parsed.operation}` };
     }
     return { status: 'ok', entry: parsed, error: null };
   } catch (error) {
@@ -255,10 +285,66 @@ function clearPendingJournal(recordFile, expectedOpId, expectedTxHash) {
   }
 }
 
+// Strict deployment transaction validation.
+function validateDeploymentTransaction(signed, journal, expectedDeployer, expectedInitcode) {
+  const parsed = parseAndValidateSignedTx(signed, 420420777, {
+    expectedSender: expectedDeployer || journal.expectedSender,
+    expectedTxHash: journal.txHash,
+    expectedTo: null,
+    expectedValue: '0',
+    expectedData: expectedInitcode || journal.expectedData,
+  });
+  const deployer = expectedDeployer || journal.expectedSender;
+  if (deployer && parsed.from.toLowerCase() !== deployer.toLowerCase()) {
+    throw new Error('deployment transaction sender does not match expected deployer');
+  }
+  if (parsed.to !== null) {
+    throw new Error('deployment transaction must be a contract creation (to must be null)');
+  }
+  if (BigInt(parsed.value || 0) !== 0n) {
+    throw new Error('deployment transaction value must be zero');
+  }
+  if (expectedInitcode && String(parsed.data || '').toLowerCase() !== String(expectedInitcode).toLowerCase()) {
+    throw new Error('deployment transaction initcode does not match expected artifact initcode');
+  }
+  return parsed;
+}
+
+// Strict binding transaction validation.
+function validateBindingTransaction(signed, journal, expectedSigner, expectedRegistry, expectedCalldata) {
+  const signer = expectedSigner || (journal ? journal.expectedSender : null);
+  const registry = expectedRegistry || (journal ? journal.expectedTo : null);
+  const calldata = expectedCalldata || (journal ? journal.expectedData : null);
+  const parsed = parseAndValidateSignedTx(signed, 420420777, {
+    expectedSender: signer,
+    expectedTxHash: journal.txHash,
+    expectedTo: registry,
+    expectedValue: '0',
+    expectedData: calldata,
+  });
+  if (signer && parsed.from.toLowerCase() !== signer.toLowerCase()) {
+    throw new Error('binding transaction sender does not match expected signer');
+  }
+  if (!parsed.to || parsed.to.toLowerCase() !== expectedRegistry.toLowerCase()) {
+    throw new Error('binding transaction destination must be the PotRegistry address');
+  }
+  if (BigInt(parsed.value || 0) !== 0n) {
+    throw new Error('binding transaction value must be zero');
+  }
+  if (expectedCalldata && String(parsed.data || '').toLowerCase() !== String(expectedCalldata).toLowerCase()) {
+    throw new Error('binding transaction calldata does not match expected binding operation');
+  }
+  return parsed;
+}
+
 module.exports = {
   FILE_MODE,
+  JOURNAL_SCHEMA_VERSION,
+  generateOperationId,
   parseAndValidateSignedTx,
   persistPendingEntry,
   readPendingJournal,
   clearPendingJournal,
+  validateDeploymentTransaction,
+  validateBindingTransaction,
 };

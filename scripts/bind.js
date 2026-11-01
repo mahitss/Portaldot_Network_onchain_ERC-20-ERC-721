@@ -42,7 +42,7 @@ const { buildLiveProbes } = require('./lib/probes.cjs');
 const { readJsonRecord, writeJsonAtomic, archiveRecord } = require('./lib/persistence.cjs');
 const { acquireLock, releaseLock } = require('./lib/file-lock.cjs');
 const { checkJournalGate } = require('./lib/journal-gate.cjs');
-const { parseAndValidateSignedTx, persistPendingEntry, readPendingJournal, clearPendingJournal } = require('./lib/transaction-journal.cjs');
+const { parseAndValidateSignedTx, persistPendingEntry, readPendingJournal, clearPendingJournal, validateDeploymentTransaction, validateBindingTransaction } = require('./lib/transaction-journal.cjs');
 const { verifyAllDeployments } = require('./lib/deployment-verifier.cjs');
 const { loadSharedMapping } = require('./lib/shared-loader.cjs');
 const { assertReleasePlanMatchesEnv, validateReleasePlan, validatePlanAgainstRecord } = require('./deploy.js');
@@ -410,10 +410,32 @@ async function runBinding({
         // new one. This preserves the nonce and txHash, eliminating duplicate
         // transaction risk after a crash between journaling and broadcast.
         // Validate the signed transaction before rebroadcasting.
-        const parsed = parseAndValidateSignedTx(signedTx, chainId, {
-          expectedTxHash: entry.txHash,
-          expectedTo: registryAddress,
-        });
+        const validationJournal = journal;
+        const expectedCalldata = (validationJournal.status === 'ok' && validationJournal.entry) ? validationJournal.entry.expectedData : null;
+        const parsed = validateBindingTransaction(signedTx, validationJournal.entry, null, null, null);
+        // Receipt-first: check if already mined.
+        const existingReceipt = await probes.receipt(entry.txHash);
+        if (existingReceipt && existingReceipt.status === 1) {
+          const confirmedEntry = { ...entry, blockNumber: existingReceipt.blockNumber, status: 'confirmed' };
+          upsertBinding(record, confirmedEntry);
+          record.updatedAt = new Date().toISOString();
+          recordIo.write(recordFile, record);
+          const verifyLoaded = recordIo.read(recordFile);
+          if (verifyLoaded.status !== 'ok' || !verifyLoaded.data) {
+            throw new Error('failed to verify persisted binding record; journal preserved for recovery');
+          }
+          pendingReconciled += 1;
+          stderr.write(`\\nbinding for ${entry.token}: already mined, reconciled without rebroadcast\\n`);
+          const opId = validationJournal.entry.operationId;
+          clearPendingJournal(recordFile, opId, entry.txHash);
+          continue;
+        }
+        // Check if transaction is known but pending.
+        const knownTx = await probes.transaction(entry.txHash);
+        if (knownTx) {
+          stderr.write(`\\nbinding for ${entry.token}: transaction known but pending, preserving state\\n`);
+          continue;
+        }
         const broadcast = await rebroadcastTx(signedTx);
         const receipt = broadcast.receipt;
         validateReceipt(entry.txHash, receipt);
