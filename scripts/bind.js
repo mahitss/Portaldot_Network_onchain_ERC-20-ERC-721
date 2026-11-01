@@ -40,8 +40,10 @@ const {
 const { runPreflight } = require('./lib/preflight.cjs');
 const { buildLiveProbes } = require('./lib/probes.cjs');
 const { readJsonRecord, writeJsonAtomic, archiveRecord } = require('./lib/persistence.cjs');
+const { parseAndValidateSignedTx, persistPendingEntry, readPendingJournal, clearPendingJournal } = require('./lib/transaction-journal.cjs');
+const { verifyAllDeployments } = require('./lib/deployment-verifier.cjs');
 const { loadSharedMapping } = require('./lib/shared-loader.cjs');
-const { assertReleasePlanMatchesEnv, validateReleasePlan } = require('./deploy.js');
+const { assertReleasePlanMatchesEnv, validateReleasePlan, validatePlanAgainstRecord } = require('./deploy.js');
 
 const root = path.resolve(__dirname, '..');
 
@@ -200,6 +202,80 @@ async function reconcilePendingBinding(entry, probes) {
 // - bindSender(params, {gasLimit, onSent}) executes one real bind
 //   transaction; onSent fires after the transaction is on its way;
 // - encodeBind(params) encodes the registry call for the live re-estimate.
+let bindLockFilePath = null;
+
+function acquireBindLock(recordFile) {
+  const lockPath = `${recordFile}.lock`;
+  bindLockFilePath = lockPath;
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+  try {
+    const fd = fs.openSync(lockPath, 'wx');
+    fs.writeSync(fd, `${process.pid}:${Date.now()}`);
+    fs.closeSync(fd);
+    return fd;
+  } catch (error) {
+    if (error.code === 'EEXIST') {
+      try {
+        const existingOwner = fs.readFileSync(lockPath, 'utf8').trim();
+        const [existingPid] = existingOwner.split(':').map(Number);
+        if (existingPid && !isNaN(existingPid)) {
+          try {
+            process.kill(existingPid, 0);
+            throw new Error(
+              `another binding process (PID ${existingPid}) is already running; refusing to start a concurrent binding. ` +
+                'If this process is no longer running, delete the .lock file next to the deployment record and retry.'
+            );
+          } catch {
+            try {
+              fs.unlinkSync(lockPath);
+            } catch {
+              // best-effort
+            }
+            const fd = fs.openSync(lockPath, 'wx');
+            fs.writeSync(fd, `${process.pid}:${Date.now()}`);
+            fs.closeSync(fd);
+            return fd;
+          }
+        }
+      } catch {
+        try {
+          fs.unlinkSync(lockPath);
+        } catch {
+          // best-effort
+        }
+        const fd = fs.openSync(lockPath, 'wx');
+        fs.writeSync(fd, `${process.pid}:${Date.now()}`);
+        fs.closeSync(fd);
+        return fd;
+      }
+    }
+    throw error;
+  }
+}
+
+function releaseBindLock() {
+  if (bindLockFilePath) {
+    try {
+      fs.unlinkSync(bindLockFilePath);
+    } catch {
+      // best-effort
+    }
+    bindLockFilePath = null;
+  }
+}
+
+process.on('exit', () => {
+  releaseBindLock();
+});
+process.on('SIGINT', () => {
+  releaseBindLock();
+  process.exit(130);
+});
+process.on('SIGTERM', () => {
+  releaseBindLock();
+  process.exit(143);
+});
+
 async function runBinding({
   env,
   recordIo,
@@ -215,13 +291,18 @@ async function runBinding({
   tokenAddresses,
   stdout = process.stdout,
   stderr = process.stderr,
+  rebroadcastTx,
 }) {
   if (!env) throw new Error('environment variables are required');
   for (const [name, value] of Object.entries({ recordIo, probes, recordFile, networkName, chainId, signerAddress, registryViews, bindSender, encodeBind })) {
     if (value === undefined) throw new Error(`runBinding: ${name} is required`);
   }
 
-  // 1. The record must exist and be strictly valid. Binding never creates
+  // Acquire cross-process lock before any state mutation to prevent
+  // concurrent binding processes from signing different operations with the same nonce.
+  acquireBindLock(recordFile);
+  try {
+    // 1. The record must exist and be strictly valid. Binding never creates
   //    or overwrites a record from nothing.
   const loaded = recordIo.read(recordFile);
   if (loaded.status === 'missing') {
@@ -255,6 +336,9 @@ async function runBinding({
   // before any binding transaction is signed.
   if (record.releasePlan) {
     validateReleasePlan(record.releasePlan);
+    // Validate plan-to-record consistency: the plan must match the
+    // record, the connected network/chain, and the signing identity.
+    validatePlanAgainstRecord(record.releasePlan, record, networkName, chainId, signerAddress, env);
     // The bind signer must be the same identity as the deployment deployer.
     const signerEvm = validateEvmAddress(signerAddress, 'signer EVM address');
     if (signerEvm !== record.releasePlan.deployer) {
@@ -273,6 +357,12 @@ async function runBinding({
         'Refusing to bind without knowing the historical configuration. Set POT_FORCE_FRESH_RELEASE=1 on the deployment to start a new release.'
     );
   }
+
+  // Before signing any binding transaction, verify that all three required
+  // contracts have confirmed deployments whose transaction evidence
+  // reconciles with the chain. Do not trust bytecode presence alone as
+  // proof of deployment identity — the receipt is the source of truth.
+  await verifyAllDeployments(record, probes);
 
   const config = await buildPreflightConfig({
     env,
@@ -348,10 +438,28 @@ async function runBinding({
   let pendingReconciled = 0;
   for (const entry of record.bindings) {
     if (entry && entry.status === 'pending') {
-      const confirmedEntry = await reconcilePendingBinding(entry, probes);
-      upsertBinding(record, confirmedEntry);
-      pendingReconciled += 1;
-      stderr.write(`\nbinding for ${entry.token}: reconciled from chain receipt ${entry.txHash} (no new transaction)\n`);
+      if (entry.signed) {
+        // Rebroadcast the exact same signed transaction instead of signing a
+        // new one. This preserves the nonce and txHash, eliminating duplicate
+        // transaction risk after a crash between journaling and broadcast.
+        const broadcast = await rebroadcastTx(entry.signed);
+        const receipt = broadcast.receipt;
+        validateReceipt(entry.txHash, receipt);
+        const confirmedEntry = {
+          ...entry,
+          blockNumber: receipt.blockNumber,
+          status: 'confirmed',
+        };
+        upsertBinding(record, confirmedEntry);
+        pendingReconciled += 1;
+        stderr.write(`\nbinding for ${entry.token}: rebroadcast journaled transaction ${entry.txHash} (no new transaction)\n`);
+        clearPendingJournal(recordFile);
+      } else {
+        const confirmedEntry = await reconcilePendingBinding(entry, probes);
+        upsertBinding(record, confirmedEntry);
+        pendingReconciled += 1;
+        stderr.write(`\nbinding for ${entry.token}: reconciled from chain receipt ${entry.txHash} (no new transaction)\n`);
+      }
     }
   }
 
@@ -505,6 +613,9 @@ async function runBinding({
   stdout.write(`\nregistry binding count ${bindingCount}\n`);
   stdout.write('next: npm run verify:deployment\n');
   return { record, preflight, sentCount, verifiedCount: verified.length, reconciledCount: pendingReconciled };
+} finally {
+    releaseBindLock();
+  }
 }
 
 async function main() {
@@ -581,10 +692,31 @@ async function main() {
     const signed = await signer.signTransaction(tx);
     const parsed = Transaction.from(signed);
     const txHash = parsed.hash;
-    // Persist the pending journal entry BEFORE broadcasting the exact signed
-    // transaction. A crash now leaves a journaled txHash that can be
-    // reconciled on retry without a duplicate broadcast.
-    if (onSent) onSent(txHash);
+    // Persist the exact signed raw transaction BEFORE broadcasting. If the
+    // process crashes now, the journaled signed bytes allow a retry to
+    // rebroadcast the exact same transaction (same nonce, same txHash)
+    // without risking a duplicate.
+    const pendingEntry = {
+      operation: 'bind',
+      contract: 'PotRegistry',
+      txHash,
+      signed,
+      params: {
+        token: params.token,
+        tokenKind: params.tokenKind,
+        nativeKind: params.nativeKind,
+        nativeId: params.nativeId,
+        nativeDecimals: params.nativeDecimals,
+        evmDecimals: params.evmDecimals,
+        nativeAccountHash: params.nativeAccountHash,
+      },
+      createdAt: new Date().toISOString(),
+      attempts: 0,
+      status: 'pending',
+    };
+    persistPendingEntry(recordFile, pendingEntry);
+    // Notify the caller (runBinding) so it can update the in-memory record.
+    if (onSent) onSent(txHash, signed);
     return provider.broadcastTransaction(signed);
   };
   const encodeBind = (params) =>
@@ -597,6 +729,13 @@ async function main() {
       BigInt(params.evmDecimals),
       params.nativeAccountHash,
     ]);
+
+  const rebroadcastBindTx = async (signed) => {
+    const parsed = parseAndValidateSignedTx(signed, Number((await hre.ethers.provider.getNetwork()).chainId));
+    const broadcast = await provider.broadcastTransaction(signed);
+    const receipt = await broadcast.wait();
+    return { receipt, address: broadcast.contractAddress };
+  };
 
   await runBinding({
     env: process.env,
@@ -614,6 +753,7 @@ async function main() {
       erc20: tokenAddresses.erc20,
       erc721: tokenAddresses.erc721,
     },
+    rebroadcastTx,
   });
 }
 

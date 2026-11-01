@@ -39,6 +39,8 @@ const {
 const { runPreflight } = require('./lib/preflight.cjs');
 const { buildLiveProbes } = require('./lib/probes.cjs');
 const { readJsonRecord, writeJsonAtomic, archiveRecord } = require('./lib/persistence.cjs');
+const { parseAndValidateSignedTx, persistPendingEntry, readPendingJournal, clearPendingJournal } = require('./lib/transaction-journal.cjs');
+const { verifyAllDeployments } = require('./lib/deployment-verifier.cjs');
 const { loadSharedMapping } = require('./lib/shared-loader.cjs');
 
 const root = path.resolve(__dirname, '..');
@@ -504,6 +506,210 @@ function budgetFooter(budget) {
 //   the pending record entry is on disk before any await on the receipt.
 // - forceFresh: the explicit, archiving fresh-release operation
 //   (POT_FORCE_FRESH_RELEASE=1).
+// Cross-process concurrency guard: prevents two release or binding
+// processes from signing different operations with the same nonce.
+// Uses a lock file next to the deployment record. The lock is released on
+// normal exit and cleaned up on process termination. Stale locks are
+// detected by checking whether the locking process is still alive.
+const LOCK_TIMEOUT_MS = 30000;
+let lockFilePath = null;
+let lockReleaseTimer = null;
+
+function acquireLock(recordFile) {
+  const lockPath = `${recordFile}.lock`;
+  lockFilePath = lockPath;
+  // Ensure the directory exists so the lock file can be created even for
+  // brand-new record files.
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+  try {
+    // O_CREAT | O_EXCL: fail if the lock file already exists (held by
+    // another process). fs.openSync with 'wx' mode fails if file exists.
+    const fd = fs.openSync(lockPath, 'wx');
+    const owner = `${process.pid}:${Date.now()}`;
+    fs.writeSync(fd, owner);
+    fs.closeSync(fd);
+    return fd;
+  } catch (error) {
+    if (error.code === 'EEXIST') {
+      // Lock file exists. Check if it's stale by reading the owner and
+      // testing whether that process is still alive (signal 0).
+      try {
+        const existingOwner = fs.readFileSync(lockPath, 'utf8').trim();
+        const [existingPid] = existingOwner.split(':').map(Number);
+        if (existingPid && !isNaN(existingPid)) {
+          try {
+            process.kill(existingPid, 0);
+            // Process is alive; lock is held by another process.
+            throw new Error(
+              `another release process (PID ${existingPid}) is already running; refusing to start a concurrent release. ` +
+                'If this process is no longer running, delete the .lock file next to the deployment record and retry.'
+            );
+          } catch (killError) {
+            // Process is dead; lock is stale. Remove it and acquire.
+            try {
+              fs.unlinkSync(lockPath);
+            } catch {
+              // best-effort; retry below
+            }
+            const fd = fs.openSync(lockPath, 'wx');
+            fs.writeSync(fd, `${process.pid}:${Date.now()}`);
+            fs.closeSync(fd);
+            return fd;
+          }
+        }
+      } catch {
+        // Could not read lock file; treat as stale and acquire.
+        try {
+          fs.unlinkSync(lockPath);
+        } catch {
+          // best-effort
+        }
+        const fd = fs.openSync(lockPath, 'wx');
+        fs.writeSync(fd, `${process.pid}:${Date.now()}`);
+        fs.closeSync(fd);
+        return fd;
+      }
+    }
+    throw error;
+  }
+}
+
+function releaseLock() {
+  if (lockFilePath) {
+    try {
+      fs.unlinkSync(lockFilePath);
+    } catch {
+      // best-effort
+    }
+    lockFilePath = null;
+  }
+  if (lockReleaseTimer) {
+    clearTimeout(lockReleaseTimer);
+    lockReleaseTimer = null;
+  }
+}
+
+// Auto-release lock on process exit (normal or abnormal).
+process.on('exit', () => {
+  releaseLock();
+});
+process.on('SIGINT', () => {
+  releaseLock();
+  process.exit(130);
+});
+process.on('SIGTERM', () => {
+  releaseLock();
+  process.exit(143);
+});
+
+// Validates that the frozen release plan is consistent with the deployment
+// record and the connected chain/identity. Throws on any mismatch so the
+// release aborts before signing or broadcasting.
+function validatePlanAgainstRecord(plan, record, networkName, chainId, deployerEvm, env = {}) {
+  if (!plan || typeof plan !== 'object') {
+    throw new Error('release plan is missing or not an object');
+  }
+  // Plan must match the record.
+  if (plan.network !== record.network) {
+    throw new Error(
+      `release plan network (${plan.network}) does not match deployment record network (${record.network}). ` +
+        'Refusing to continue; set POT_FORCE_FRESH_RELEASE=1 to start a new release.'
+    );
+  }
+  if (plan.chainId !== record.chainId) {
+    throw new Error(
+      `release plan chainId (${plan.chainId}) does not match deployment record chainId (${record.chainId}). ` +
+        'Refusing to continue; set POT_FORCE_FRESH_RELEASE=1 to start a new release.'
+    );
+  }
+  if (plan.deployer !== record.deployer) {
+    throw new Error(
+      `release plan deployer (${plan.deployer}) does not match deployment record deployer (${record.deployer}). ` +
+        'Refusing to continue; set POT_FORCE_FRESH_RELEASE=1 to start a new release.'
+    );
+  }
+  // Plan must match the connected environment.
+  if (plan.network !== networkName) {
+    throw new Error(
+      `release plan network (${plan.network}) does not match connected network (${networkName}). ` +
+        'Refusing to continue; set POT_FORCE_FRESH_RELEASE=1 to start a new release.'
+    );
+  }
+  if (plan.chainId !== chainId) {
+    throw new Error(
+      `release plan chainId (${plan.chainId}) does not match connected chainId (${chainId}). ` +
+        'Refusing to continue; set POT_FORCE_FRESH_RELEASE=1 to start a new release.'
+    );
+  }
+  if (plan.deployer !== deployerEvm) {
+    throw new Error(
+      `release plan deployer (${plan.deployer}) does not match connected deployer (${deployerEvm}). ` +
+        'Refusing to continue; set POT_FORCE_FRESH_RELEASE=1 to start a new release.'
+    );
+  }
+  // Exactly one asset and one nft_collection entry.
+  if (!Array.isArray(plan.nativeObjects) || plan.nativeObjects.length !== 2) {
+    throw new Error(
+      'release plan must contain exactly two native object entries (one asset, one nft_collection). ' +
+        'Refusing to continue; set POT_FORCE_FRESH_RELEASE=1 to start a new release.'
+    );
+  }
+  const kinds = plan.nativeObjects.map((o) => o.kind);
+  if (!kinds.includes('asset') || !kinds.includes('nft_collection')) {
+    throw new Error(
+      'release plan must contain exactly one asset and one nft_collection entry. ' +
+        'Refusing to continue; set POT_FORCE_FRESH_RELEASE=1 to start a new release.'
+    );
+  }
+  if (kinds.length !== new Set(kinds).size) {
+    throw new Error(
+      'release plan contains duplicate native object kinds. ' +
+        'Refusing to continue; set POT_FORCE_FRESH_RELEASE=1 to start a new release.'
+    );
+  }
+  // All four token metadata fields must be valid strings within limits.
+  if (!plan.tokenConfig || typeof plan.tokenConfig !== 'object') {
+    throw new Error('release plan is missing token configuration');
+  }
+  for (const field of ['erc20Name', 'erc20Symbol', 'erc721Name', 'erc721Symbol']) {
+    if (typeof plan.tokenConfig[field] !== 'string' || plan.tokenConfig[field].length === 0 || plan.tokenConfig[field].length > 64) {
+      throw new Error(
+        `release plan tokenConfig.${field} is missing, empty, or longer than 64 characters. ` +
+          'Refusing to continue; set POT_FORCE_FRESH_RELEASE=1 to start a new release.'
+      );
+    }
+  }
+  // Native IDs must be valid uint32.
+  for (const object of plan.nativeObjects) {
+    validateNativeId(object.id, `release plan nativeObjects ${object.kind} id`);
+  }
+  // Native IDs must match env configuration.
+  const assetObject = plan.nativeObjects.find((o) => o.kind === 'asset');
+  const nftObject = plan.nativeObjects.find((o) => o.kind === 'nft_collection');
+  const envAssetId = env.POT_NATIVE_ASSET_ID !== undefined && env.POT_NATIVE_ASSET_ID !== '' ? validateNativeId(env.POT_NATIVE_ASSET_ID, 'POT_NATIVE_ASSET_ID') : null;
+  const envNftId = env.POT_NATIVE_NFT_ID !== undefined && env.POT_NATIVE_NFT_ID !== '' ? validateNativeId(env.POT_NATIVE_NFT_ID, 'POT_NATIVE_NFT_ID') : null;
+  if (envAssetId !== null && assetObject.id !== envAssetId) {
+    throw new Error(
+      'release plan binds native asset id ' + assetObject.id + ' but the environment configures ' + envAssetId + '. ' +
+        'Refusing to drift the recorded deployment configuration. Use POT_FORCE_FRESH_RELEASE=1 to start a new release.'
+    );
+  }
+  if (envNftId !== null && nftObject.id !== envNftId) {
+    throw new Error(
+      'release plan binds native NFT id ' + nftObject.id + ' but the environment configures ' + envNftId + '. ' +
+        'Refusing to drift the recorded deployment configuration. Use POT_FORCE_FRESH_RELEASE=1 to start a new release.'
+    );
+  }
+  // Commitment must be valid.
+  if (typeof plan.nativeAccountHash !== 'string') {
+    throw new Error('release plan has no nativeAccountHash');
+  }
+  validateNativeAccountHash(plan.nativeAccountHash, 'release plan nativeAccountHash');
+  if (plan.commitmentSource !== 'derived' && plan.commitmentSource !== 'override') {
+    throw new Error('release plan has invalid commitmentSource');
+  }
+}
+
 async function runRelease({
   env,
   deployerAddress,
@@ -517,20 +723,24 @@ async function runRelease({
   forceFresh = false,
   stdout = process.stdout,
   stderr = process.stderr,
+  rebroadcastTx,
 }) {
   if (!env) throw new Error('environment variables are required');
   for (const [name, value] of Object.entries({ recordIo, probes, deployContract, recordFile, networkName, chainId })) {
     if (value === undefined) throw new Error(`runRelease: ${name} is required`);
   }
 
+  // Acquire cross-process lock before any state mutation to prevent
+  // concurrent processes from signing different operations with the same nonce.
+  acquireLock(recordFile);
   // Build the preflight config from the environment first (no frozen plan).
-  // This is needed for missing/malformed record branches below. When an
-  // existing record carries an immutable release plan, the config is rebuilt
-  // with that plan after the record is loaded and env-plan compatibility is
-  // validated.
-  const config = await buildPreflightConfig({ env, deployerAddress, wsUrl });
+    // This is needed for missing/malformed record branches below. When an
+    // existing record carries an immutable release plan, the config is rebuilt
+    // with that plan after the record is loaded and env-plan compatibility is
+    // validated.
+    const config = await buildPreflightConfig({ env, deployerAddress, wsUrl });
 
-  // 1. Load the existing record. Malformed or mismatched records are never
+    // 1. Load the existing record. Malformed or mismatched records are never
   //    silently overwritten; the ONLY replacement is a deliberate fresh
   //    operation that first archives the old file.
   const loaded = recordIo.read(recordFile);
@@ -598,14 +808,18 @@ async function runRelease({
       // Validate the persisted release plan structurally before using it.
       if (record.releasePlan) {
         validateReleasePlan(record.releasePlan);
-      }
-      if (forceFresh) {
-        archived.push(recordIo.archive(recordFile));
-        const releasePlan = buildReleasePlan({ config, networkName, chainId });
-        record = newRecord({ config, networkName, chainId, releasePlan });
-        stderr.write(`fresh release: explicit fresh deployment archived the existing record, starting clean\n`);
+        // Validate plan-to-record consistency: the plan must match the
+        // record, the connected network/chain, and the signing deployer.
+        validatePlanAgainstRecord(record.releasePlan, record, networkName, chainId, 
+          deployerAddress, env);
       }
     }
+  }
+  if (forceFresh) {
+    archived.push(recordIo.archive(recordFile));
+    const releasePlan = buildReleasePlan({ config, networkName, chainId });
+    record = newRecord({ config, networkName, chainId, releasePlan });
+    stderr.write(`fresh release: explicit fresh deployment archived the existing record, starting clean\n`);
   }
 
   // When resuming against an existing record that carries an immutable
@@ -629,9 +843,55 @@ async function runRelease({
   //    ambiguous silently converts into success.
   for (const [name, entry] of Object.entries(record.contracts)) {
     if (entry.status === 'pending') {
-      record.contracts[name] = await reconcilePendingEntry(name, entry, probes);
-      reuseNotes.push(`${name}: reconciled from chain receipt ${entry.txHash} (no new transaction)`);
-      stderr.write(`\n${name}: reconciled from chain receipt ${entry.txHash}\n`);
+      if (entry.signed) {
+        // Rebroadcast the exact same signed transaction instead of signing a
+        // new one. This preserves the nonce and txHash, eliminating duplicate
+        // transaction risk after a crash between journaling and broadcast.
+        const broadcast = await rebroadcastTx(entry.signed);
+        const receipt = broadcast.receipt;
+        validateReceipt(entry.txHash, receipt);
+        if (
+          typeof receipt.contractAddress !== 'string' ||
+          !/^0x[0-9a-fA-F]{40}$/.test(receipt.contractAddress)
+        ) {
+          throw new Error(
+            `cannot reconcile ${name}: the receipt for ${entry.txHash} does not contain a valid contract-creation address; refusing to reuse or redeploy`
+          );
+        }
+        if (typeof entry.address === 'string' && String(receipt.contractAddress).toLowerCase() !== String(entry.address).toLowerCase()) {
+          throw new Error(
+            `cannot reconcile ${name}: the receipt contract address ${receipt.contractAddress} does not match the journaled address ${entry.address}; refusing to reuse or redeploy`
+          );
+        }
+        if (!Number.isSafeInteger(receipt.blockNumber) || receipt.blockNumber < 0) {
+          throw new Error(
+            `cannot reuse ${name}: the receipt for ${entry.txHash} has an invalid block number ${JSON.stringify(receipt.blockNumber)}; refusing to reuse or redeploy`
+          );
+        }
+        const code = await probes.code(receipt.contractAddress);
+        if (typeof code !== 'string' || code === '0x') {
+          throw new Error(
+            `cannot reuse ${name}: the receipt reports success but no bytecode exists at ${receipt.contractAddress}; the outcome is ambiguous, refusing to reuse or redeploy`
+          );
+        }
+        record.contracts[name] = {
+          address: receipt.contractAddress,
+          txHash: entry.txHash,
+          blockNumber: receipt.blockNumber,
+          gasLimit: entry.gasLimit,
+          status: 'confirmed',
+        };
+        syncTokens(record, config.tokenConfig);
+        record.updatedAt = new Date().toISOString();
+        recordIo.write(recordFile, record);
+        reuseNotes.push(`${name}: rebroadcast journaled transaction ${entry.txHash} (no new transaction)`);
+        stderr.write(`\n${name}: rebroadcast journaled transaction ${entry.txHash}\n`);
+        clearPendingJournal(recordFile);
+      } else {
+        record.contracts[name] = await reconcilePendingEntry(name, entry, probes);
+        reuseNotes.push(`${name}: reconciled from chain receipt ${entry.txHash} (no new transaction)`);
+        stderr.write(`\n${name}: reconciled from chain receipt ${entry.txHash}\n`);
+      }
     } else {
       await verifyConfirmedEntry(name, entry, probes);
       reuseNotes.push(`${name}: confirmed record entry reused (bytecode verified at ${entry.address})`);
@@ -699,9 +959,10 @@ async function runRelease({
     }
     sentCount += 1;
     const result = await deployContract(artifact, gasLimit, {
-      onSent: (txHash) => {
+      onSent: (txHash, signed) => {
         record.contracts[artifact.name] = {
           txHash,
+          signed,
           gasLimit: gasLimit.toString(),
           status: 'pending',
         };
@@ -745,6 +1006,7 @@ async function runRelease({
     throw new Error('the deployment phase ended without every required contract confirmed; the record reflects exactly what succeeded and the run fails closed');
   }
   stdout.write('next: npm run bind:testnet (binding re-runs its own stage-aware preflight), then npm run verify:deployment\n');
+  releaseLock();
   return { record, preflight, sentCount, reusedCount: deployedNames.length - outstandingArtifacts.length, archived };
 }
 
@@ -788,14 +1050,38 @@ async function main() {
     const signed = await deployer.signTransaction(tx);
     const parsed = Transaction.from(signed);
     const txHash = parsed.hash;
-    // Persist the pending journal entry BEFORE broadcasting the exact signed
-    // transaction. If the process crashes now, the journaled txHash allows
-    // reconciliation on retry without a duplicate broadcast.
-    if (hooks.onSent) hooks.onSent(txHash);
+    // Persist the exact signed raw transaction BEFORE broadcasting. If the
+    // process crashes now, the journaled signed bytes allow a retry to
+    // rebroadcast the exact same transaction (same nonce, same txHash) without
+    // risking a duplicate.
+    const pendingEntry = {
+      operation: 'deploy',
+      contract: artifact.name,
+      txHash,
+      signed,
+      params: {
+        artifact: artifact.name,
+        gasLimit: gasLimit.toString(),
+        args: artifact.args,
+      },
+      createdAt: new Date().toISOString(),
+      attempts: 0,
+      status: 'pending',
+    };
+    persistPendingEntry(recordFile, pendingEntry);
+    // Notify the caller (runRelease) so it can update the in-memory record.
+    if (hooks.onSent) hooks.onSent(txHash, signed);
     const broadcast = await provider.broadcastTransaction(signed);
     const receipt = await broadcast.wait();
     if (hooks.onReceipt) hooks.onReceipt(receipt);
     return { txHash, receipt, address: broadcast.contractAddress };
+  };
+
+  const rebroadcastTx = async (signed) => {
+    const parsed = parseAndValidateSignedTx(signed, Number((await hre.ethers.provider.getNetwork()).chainId));
+    const broadcast = await provider.broadcastTransaction(signed);
+    const receipt = await broadcast.wait();
+    return { receipt, address: broadcast.contractAddress };
   };
 
   await runRelease({
@@ -809,6 +1095,7 @@ async function main() {
     networkName,
     chainId: Number((await hre.ethers.provider.getNetwork()).chainId),
     forceFresh: String(process.env.POT_FORCE_FRESH_RELEASE || '') === '1',
+    rebroadcastTx,
   });
 }
 
@@ -826,4 +1113,5 @@ module.exports = {
   BINDING_TOTAL,
   assertReleasePlanMatchesEnv,
   validateReleasePlan,
+  validatePlanAgainstRecord,
 };
