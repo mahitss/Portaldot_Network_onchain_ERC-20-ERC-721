@@ -648,6 +648,41 @@ async function runRelease({
   // concurrent processes from signing different operations with the same nonce.
   const lock = acquireLock(recordFile);
   try {
+    // JOURNAL-FIRST: read and validate the journal before any new signing.
+    const existingJournal = readPendingJournal(recordFile);
+    if (existingJournal.status === 'ok' && existingJournal.entry) {
+      const je = existingJournal.entry;
+      // Validate the journal against the deployment record if one exists.
+      const loaded = recordIo.read(recordFile);
+      if (loaded.status === 'ok' && loaded.data) {
+        const record = loaded.data;
+        // Match journal txHash against record pending entries.
+        let matched = false;
+        for (const [name, entry] of Object.entries(record.contracts || {})) {
+          if (entry && entry.status === 'pending' && entry.txHash === je.txHash) {
+            matched = true;
+            break;
+          }
+        }
+        if (!matched && record.contracts) {
+          // Orphaned journal: no matching pending entry in record.
+          // Fail closed with actionable instructions.
+          throw new Error(
+            `an unresolved transaction journal exists (txHash: ${je.txHash}) but no matching pending entry was found in the deployment record. ` +
+              'This may indicate a crash between journal and record persistence. ' +
+              'Inspect the journal file and deployment record; reconcile manually before retrying. ' +
+              'Do not start a new release while this journal is unresolved.'
+          );
+        }
+      }
+      // If we get here, the journal is valid and matched. It will be
+      // reconciled in the pending-entry loop below.
+    } else if (existingJournal.status === 'malformed') {
+      throw new Error(
+        `the transaction journal at ${recordFile}.journal is malformed (${existingJournal.error}). ` +
+          'Refusing to proceed. Inspect and resolve the journal manually before retrying.'
+      );
+    }
     // Build the preflight config from the environment first (no frozen plan).
     // This is needed for missing/malformed record branches below. When an
     // existing record carries an immutable release plan, the config is rebuilt
@@ -768,6 +803,11 @@ async function runRelease({
         // Rebroadcast the exact same signed transaction instead of signing a
         // new one. This preserves the nonce and txHash, eliminating duplicate
         // transaction risk after a crash between journaling and broadcast.
+        // Validate the signed transaction before rebroadcasting.
+        const parsed = parseAndValidateSignedTx(signedTx, chainId, {
+          expectedTxHash: entry.txHash,
+          expectedTo: null, // contract creation
+        });
         const broadcast = await rebroadcastTx(signedTx);
         const receipt = broadcast.receipt;
         validateReceipt(entry.txHash, receipt);
