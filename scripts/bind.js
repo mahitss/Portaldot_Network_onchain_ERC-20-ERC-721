@@ -40,6 +40,7 @@ const {
 const { runPreflight } = require('./lib/preflight.cjs');
 const { buildLiveProbes } = require('./lib/probes.cjs');
 const { readJsonRecord, writeJsonAtomic, archiveRecord } = require('./lib/persistence.cjs');
+const { acquireLock, releaseLock } = require('./lib/file-lock.cjs');
 const { parseAndValidateSignedTx, persistPendingEntry, readPendingJournal, clearPendingJournal } = require('./lib/transaction-journal.cjs');
 const { verifyAllDeployments } = require('./lib/deployment-verifier.cjs');
 const { loadSharedMapping } = require('./lib/shared-loader.cjs');
@@ -202,79 +203,8 @@ async function reconcilePendingBinding(entry, probes) {
 // - bindSender(params, {gasLimit, onSent}) executes one real bind
 //   transaction; onSent fires after the transaction is on its way;
 // - encodeBind(params) encodes the registry call for the live re-estimate.
-let bindLockFilePath = null;
-
-function acquireBindLock(recordFile) {
-  const lockPath = `${recordFile}.lock`;
-  bindLockFilePath = lockPath;
-  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
-  try {
-    const fd = fs.openSync(lockPath, 'wx');
-    fs.writeSync(fd, `${process.pid}:${Date.now()}`);
-    fs.closeSync(fd);
-    return fd;
-  } catch (error) {
-    if (error.code === 'EEXIST') {
-      try {
-        const existingOwner = fs.readFileSync(lockPath, 'utf8').trim();
-        const [existingPid] = existingOwner.split(':').map(Number);
-        if (existingPid && !isNaN(existingPid)) {
-          try {
-            process.kill(existingPid, 0);
-            throw new Error(
-              `another binding process (PID ${existingPid}) is already running; refusing to start a concurrent binding. ` +
-                'If this process is no longer running, delete the .lock file next to the deployment record and retry.'
-            );
-          } catch {
-            try {
-              fs.unlinkSync(lockPath);
-            } catch {
-              // best-effort
-            }
-            const fd = fs.openSync(lockPath, 'wx');
-            fs.writeSync(fd, `${process.pid}:${Date.now()}`);
-            fs.closeSync(fd);
-            return fd;
-          }
-        }
-      } catch {
-        try {
-          fs.unlinkSync(lockPath);
-        } catch {
-          // best-effort
-        }
-        const fd = fs.openSync(lockPath, 'wx');
-        fs.writeSync(fd, `${process.pid}:${Date.now()}`);
-        fs.closeSync(fd);
-        return fd;
-      }
-    }
-    throw error;
-  }
-}
-
-function releaseBindLock() {
-  if (bindLockFilePath) {
-    try {
-      fs.unlinkSync(bindLockFilePath);
-    } catch {
-      // best-effort
-    }
-    bindLockFilePath = null;
-  }
-}
-
-process.on('exit', () => {
-  releaseBindLock();
-});
-process.on('SIGINT', () => {
-  releaseBindLock();
-  process.exit(130);
-});
-process.on('SIGTERM', () => {
-  releaseBindLock();
-  process.exit(143);
-});
+// Lock lifecycle is managed by the shared file-lock module.
+// See scripts/lib/file-lock.cjs for the implementation.
 
 async function runBinding({
   env,
@@ -300,7 +230,7 @@ async function runBinding({
 
   // Acquire cross-process lock before any state mutation to prevent
   // concurrent binding processes from signing different operations with the same nonce.
-  acquireBindLock(recordFile);
+  const lock = acquireLock(recordFile);
   try {
     // 1. The record must exist and be strictly valid. Binding never creates
   //    or overwrites a record from nothing.
@@ -438,11 +368,15 @@ async function runBinding({
   let pendingReconciled = 0;
   for (const entry of record.bindings) {
     if (entry && entry.status === 'pending') {
-      if (entry.signed) {
+      const journal = readPendingJournal(recordFile);
+      const signedTx = (journal.status === 'ok' && journal.entry && journal.entry.txHash === entry.txHash)
+        ? journal.entry.signed
+        : null;
+      if (signedTx) {
         // Rebroadcast the exact same signed transaction instead of signing a
         // new one. This preserves the nonce and txHash, eliminating duplicate
         // transaction risk after a crash between journaling and broadcast.
-        const broadcast = await rebroadcastTx(entry.signed);
+        const broadcast = await rebroadcastTx(signedTx);
         const receipt = broadcast.receipt;
         validateReceipt(entry.txHash, receipt);
         const confirmedEntry = {
@@ -613,8 +547,8 @@ async function runBinding({
   stdout.write(`\nregistry binding count ${bindingCount}\n`);
   stdout.write('next: npm run verify:deployment\n');
   return { record, preflight, sentCount, verifiedCount: verified.length, reconciledCount: pendingReconciled };
-} finally {
-    releaseBindLock();
+  } finally {
+    lock.release();
   }
 }
 

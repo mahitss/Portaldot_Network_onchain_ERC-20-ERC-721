@@ -39,6 +39,7 @@ const {
 const { runPreflight } = require('./lib/preflight.cjs');
 const { buildLiveProbes } = require('./lib/probes.cjs');
 const { readJsonRecord, writeJsonAtomic, archiveRecord } = require('./lib/persistence.cjs');
+const { acquireLock, releaseLock } = require('./lib/file-lock.cjs');
 const { parseAndValidateSignedTx, persistPendingEntry, readPendingJournal, clearPendingJournal } = require('./lib/transaction-journal.cjs');
 const { verifyAllDeployments } = require('./lib/deployment-verifier.cjs');
 const { loadSharedMapping } = require('./lib/shared-loader.cjs');
@@ -512,95 +513,8 @@ function budgetFooter(budget) {
 // normal exit and cleaned up on process termination. Stale locks are
 // detected by checking whether the locking process is still alive.
 const LOCK_TIMEOUT_MS = 30000;
-let lockFilePath = null;
-let lockReleaseTimer = null;
-
-function acquireLock(recordFile) {
-  const lockPath = `${recordFile}.lock`;
-  lockFilePath = lockPath;
-  // Ensure the directory exists so the lock file can be created even for
-  // brand-new record files.
-  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
-  try {
-    // O_CREAT | O_EXCL: fail if the lock file already exists (held by
-    // another process). fs.openSync with 'wx' mode fails if file exists.
-    const fd = fs.openSync(lockPath, 'wx');
-    const owner = `${process.pid}:${Date.now()}`;
-    fs.writeSync(fd, owner);
-    fs.closeSync(fd);
-    return fd;
-  } catch (error) {
-    if (error.code === 'EEXIST') {
-      // Lock file exists. Check if it's stale by reading the owner and
-      // testing whether that process is still alive (signal 0).
-      try {
-        const existingOwner = fs.readFileSync(lockPath, 'utf8').trim();
-        const [existingPid] = existingOwner.split(':').map(Number);
-        if (existingPid && !isNaN(existingPid)) {
-          try {
-            process.kill(existingPid, 0);
-            // Process is alive; lock is held by another process.
-            throw new Error(
-              `another release process (PID ${existingPid}) is already running; refusing to start a concurrent release. ` +
-                'If this process is no longer running, delete the .lock file next to the deployment record and retry.'
-            );
-          } catch (killError) {
-            // Process is dead; lock is stale. Remove it and acquire.
-            try {
-              fs.unlinkSync(lockPath);
-            } catch {
-              // best-effort; retry below
-            }
-            const fd = fs.openSync(lockPath, 'wx');
-            fs.writeSync(fd, `${process.pid}:${Date.now()}`);
-            fs.closeSync(fd);
-            return fd;
-          }
-        }
-      } catch {
-        // Could not read lock file; treat as stale and acquire.
-        try {
-          fs.unlinkSync(lockPath);
-        } catch {
-          // best-effort
-        }
-        const fd = fs.openSync(lockPath, 'wx');
-        fs.writeSync(fd, `${process.pid}:${Date.now()}`);
-        fs.closeSync(fd);
-        return fd;
-      }
-    }
-    throw error;
-  }
-}
-
-function releaseLock() {
-  if (lockFilePath) {
-    try {
-      fs.unlinkSync(lockFilePath);
-    } catch {
-      // best-effort
-    }
-    lockFilePath = null;
-  }
-  if (lockReleaseTimer) {
-    clearTimeout(lockReleaseTimer);
-    lockReleaseTimer = null;
-  }
-}
-
-// Auto-release lock on process exit (normal or abnormal).
-process.on('exit', () => {
-  releaseLock();
-});
-process.on('SIGINT', () => {
-  releaseLock();
-  process.exit(130);
-});
-process.on('SIGTERM', () => {
-  releaseLock();
-  process.exit(143);
-});
+// Lock lifecycle is managed by the shared file-lock module.
+// See scripts/lib/file-lock.cjs for the implementation.
 
 // Validates that the frozen release plan is consistent with the deployment
 // record and the connected chain/identity. Throws on any mismatch so the
@@ -732,8 +646,9 @@ async function runRelease({
 
   // Acquire cross-process lock before any state mutation to prevent
   // concurrent processes from signing different operations with the same nonce.
-  acquireLock(recordFile);
-  // Build the preflight config from the environment first (no frozen plan).
+  const lock = acquireLock(recordFile);
+  try {
+    // Build the preflight config from the environment first (no frozen plan).
     // This is needed for missing/malformed record branches below. When an
     // existing record carries an immutable release plan, the config is rebuilt
     // with that plan after the record is loaded and env-plan compatibility is
@@ -843,11 +758,17 @@ async function runRelease({
   //    ambiguous silently converts into success.
   for (const [name, entry] of Object.entries(record.contracts)) {
     if (entry.status === 'pending') {
-      if (entry.signed) {
+      // Check the journal first — it is the authoritative source for
+      // replay-capable signed transaction bytes.
+      const journal = readPendingJournal(recordFile);
+      const signedTx = (journal.status === 'ok' && journal.entry && journal.entry.txHash === entry.txHash)
+        ? journal.entry.signed
+        : null;
+      if (signedTx) {
         // Rebroadcast the exact same signed transaction instead of signing a
         // new one. This preserves the nonce and txHash, eliminating duplicate
         // transaction risk after a crash between journaling and broadcast.
-        const broadcast = await rebroadcastTx(entry.signed);
+        const broadcast = await rebroadcastTx(signedTx);
         const receipt = broadcast.receipt;
         validateReceipt(entry.txHash, receipt);
         if (
@@ -959,10 +880,9 @@ async function runRelease({
     }
     sentCount += 1;
     const result = await deployContract(artifact, gasLimit, {
-      onSent: (txHash, signed) => {
+      onSent: (txHash) => {
         record.contracts[artifact.name] = {
           txHash,
-          signed,
           gasLimit: gasLimit.toString(),
           status: 'pending',
         };
@@ -1008,6 +928,9 @@ async function runRelease({
   stdout.write('next: npm run bind:testnet (binding re-runs its own stage-aware preflight), then npm run verify:deployment\n');
   releaseLock();
   return { record, preflight, sentCount, reusedCount: deployedNames.length - outstandingArtifacts.length, archived };
+  } finally {
+    lock.release();
+  }
 }
 
 async function main() {
