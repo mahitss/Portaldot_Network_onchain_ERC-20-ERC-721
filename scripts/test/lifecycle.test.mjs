@@ -1238,6 +1238,18 @@ test('Objective B: crash before broadcast - journaled pending entry rebroadcast 
       status: 'pending',
     };
     hooks.onSent(txHash, signedTx);
+    // Simulate journal persistence (done by deployContract in production)
+    const { persistPendingEntry } = await import('../lib/transaction-journal.cjs');
+    persistPendingEntry(recordFile, {
+      operation: 'deploy',
+      contract: artifact.name,
+      txHash,
+      signed: signedTx,
+      params: { artifact: artifact.name, gasLimit: gasLimit.toString(), args: artifact.args },
+      createdAt: new Date().toISOString(),
+      attempts: 1,
+      status: 'pending',
+    });
     throw new Error('crash after journaling, before broadcast');
   };
   let sent1 = 0;
@@ -1273,7 +1285,9 @@ test('Objective B: crash before broadcast - journaled pending entry rebroadcast 
   const afterCrash = recordIo.state();
   assert.equal(afterCrash.contracts.PotERC20.status, 'pending', 'pending entry journaled before broadcast');
   assert.equal(afterCrash.contracts.PotERC20.txHash, txHash, 'journaled txHash recorded');
-  assert.equal(afterCrash.contracts.PotERC20.signed, signedTx, 'signed raw bytes journaled');
+  const journal = (await import('../lib/transaction-journal.cjs')).readPendingJournal(recordFile);
+  assert.equal(journal.status, 'ok', 'journal persisted');
+  assert.equal(journal.entry.signed, signedTx, 'signed raw bytes journaled in journal, not in record');
 
   // Second run: rebroadcast the exact same signed tx, reconcile with receipt
   const probes2 = makeProbes({

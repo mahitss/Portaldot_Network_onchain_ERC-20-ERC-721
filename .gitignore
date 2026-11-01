@@ -13,6 +13,11 @@ Thumbs.db
 deployments/local/
 deployments/localhost.json
 deployments/hardhat.json
+deployments/*.json
+deployments/*.json.lock
+deployments/*.journal
+deployments/*.lock
+deployments/*.tmp-*
 app/bundle.js
 .vscode/
 .idea/
