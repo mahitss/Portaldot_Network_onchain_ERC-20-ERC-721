@@ -431,7 +431,9 @@ async function runBinding({
         }
         pendingReconciled += 1;
         stderr.write(`\nbinding for ${entry.token}: rebroadcast journaled transaction ${entry.txHash} (no new transaction)\n`);
-        clearPendingJournal(recordFile);
+        const journal = readPendingJournal(recordFile);
+        const opId = (journal.status === 'ok' && journal.entry) ? journal.entry.operationId : null;
+        clearPendingJournal(recordFile, opId, entry.txHash);
       } else {
         const confirmedEntry = await reconcilePendingBinding(entry, probes);
         upsertBinding(record, confirmedEntry);
@@ -675,10 +677,18 @@ async function main() {
     // rebroadcast the exact same transaction (same nonce, same txHash)
     // without risking a duplicate.
     const pendingEntry = {
+      schemaVersion: 1,
+      operationId: require('node:crypto').randomUUID(),
       operation: 'bind',
       contract: 'PotRegistry',
       txHash,
       signed,
+      expectedSender: signer.address,
+      chainId: Number(network.chainId),
+      nonce: nonce,
+      expectedTo: registryAddress,
+      expectedValue: '0',
+      expectedData: data,
       params: {
         token: params.token,
         tokenKind: params.tokenKind,

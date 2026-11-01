@@ -1245,6 +1245,8 @@ test('Objective B: crash before broadcast - journaled pending entry rebroadcast 
     // Simulate journal persistence (done by deployContract in production)
     const { persistPendingEntry } = await import('../lib/transaction-journal.cjs');
     persistPendingEntry(recordFile, {
+      schemaVersion: 1,
+      operationId: 'test-op-1',
       operation: 'deploy',
       contract: artifact.name,
       txHash,

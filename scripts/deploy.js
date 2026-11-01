@@ -853,7 +853,9 @@ async function runRelease({
         recordIo.write(recordFile, record);
         reuseNotes.push(`${name}: rebroadcast journaled transaction ${entry.txHash} (no new transaction)`);
         stderr.write(`\n${name}: rebroadcast journaled transaction ${entry.txHash}\n`);
-        clearPendingJournal(recordFile);
+        const journal = readPendingJournal(recordFile);
+        const opId = (journal.status === 'ok' && journal.entry) ? journal.entry.operationId : null;
+        clearPendingJournal(recordFile, opId, entry.txHash);
       } else {
         record.contracts[name] = await reconcilePendingEntry(name, entry, probes);
         reuseNotes.push(`${name}: reconciled from chain receipt ${entry.txHash} (no new transaction)`);
@@ -1024,10 +1026,18 @@ async function main() {
     // rebroadcast the exact same transaction (same nonce, same txHash) without
     // risking a duplicate.
     const pendingEntry = {
+      schemaVersion: 1,
+      operationId: require('node:crypto').randomUUID(),
       operation: 'deploy',
       contract: artifact.name,
       txHash,
       signed,
+      expectedSender: deployer.address,
+      chainId: Number(network.chainId),
+      nonce: nonce,
+      expectedTo: null,
+      expectedValue: '0',
+      expectedData: deployTx.data,
       params: {
         artifact: artifact.name,
         gasLimit: gasLimit.toString(),

@@ -27,10 +27,17 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { Transaction } = require('ethers');
+
+const JOURNAL_SCHEMA_VERSION = 1;
 
 // Owner-only file permissions (0o600) where supported.
 const FILE_MODE = 0o600;
+
+function generateOperationId() {
+  return crypto.randomUUID();
+}
 
 const PORTALDOT_CHAIN_ID = 420420777;
 
@@ -196,6 +203,14 @@ function readPendingJournal(recordFile) {
   }
   try {
     const parsed = JSON.parse(fs.readFileSync(journalPath, 'utf8'));
+    // Validate schema version.
+    if (parsed.schemaVersion !== undefined && parsed.schemaVersion !== JOURNAL_SCHEMA_VERSION) {
+      return { status: 'malformed', entry: null, error: `unsupported schema version ${parsed.schemaVersion}` };
+    }
+    // Validate required fields.
+    if (!parsed.operation || !parsed.txHash || !parsed.signed || !parsed.operationId) {
+      return { status: 'malformed', entry: null, error: 'journal missing required fields (operation, txHash, signed, operationId)' };
+    }
     return { status: 'ok', entry: parsed, error: null };
   } catch (error) {
     return { status: 'malformed', entry: null, error: error.message };
@@ -206,22 +221,32 @@ function readPendingJournal(recordFile) {
 // deployment record has been updated. Requires matching operation ID and
 // txHash to prevent deleting a different journal.
 function clearPendingJournal(recordFile, expectedOpId, expectedTxHash) {
+  if (!expectedOpId) {
+    throw new Error('clearPendingJournal requires an operation ID');
+  }
+  if (!expectedTxHash) {
+    throw new Error('clearPendingJournal requires a transaction hash');
+  }
   const journalPath = `${recordFile}.journal`;
   if (!fs.existsSync(journalPath)) {
     return; // already cleared
   }
   const existing = readPendingJournal(recordFile);
-  if (existing.status === 'ok' && existing.entry) {
-    if (expectedOpId && existing.entry.operationId && existing.entry.operationId !== expectedOpId) {
-      throw new Error(
-        `refusing to clear journal: operation ID mismatch (expected ${expectedOpId}, found ${existing.entry.operationId})`
-      );
-    }
-    if (expectedTxHash && existing.entry.txHash && existing.entry.txHash !== expectedTxHash) {
-      throw new Error(
-        `refusing to clear journal: txHash mismatch (expected ${expectedTxHash}, found ${existing.entry.txHash})`
-      );
-    }
+  if (existing.status !== 'ok' || !existing.entry) {
+    throw new Error('cannot clear journal: journal is malformed or unreadable');
+  }
+  if (!existing.entry.operationId) {
+    throw new Error('cannot clear journal: journal has no operation ID');
+  }
+  if (existing.entry.operationId !== expectedOpId) {
+    throw new Error(
+      `refusing to clear journal: operation ID mismatch (expected ${expectedOpId}, found ${existing.entry.operationId})`
+    );
+  }
+  if (existing.entry.txHash !== expectedTxHash) {
+    throw new Error(
+      `refusing to clear journal: txHash mismatch (expected ${expectedTxHash}, found ${existing.entry.txHash})`
+    );
   }
   try {
     fs.unlinkSync(journalPath);
