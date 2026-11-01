@@ -417,6 +417,12 @@ async function runBinding({
           status: 'confirmed',
         };
         upsertBinding(record, confirmedEntry);
+        record.updatedAt = new Date().toISOString();
+        recordIo.write(recordFile, record);
+        const verifyLoaded = recordIo.read(recordFile);
+        if (verifyLoaded.status !== 'ok' || !verifyLoaded.data) {
+          throw new Error('failed to verify persisted binding record; journal preserved for recovery');
+        }
         pendingReconciled += 1;
         stderr.write(`\nbinding for ${entry.token}: rebroadcast journaled transaction ${entry.txHash} (no new transaction)\n`);
         clearPendingJournal(recordFile);
