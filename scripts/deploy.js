@@ -41,7 +41,7 @@ const { buildLiveProbes } = require('./lib/probes.cjs');
 const { readJsonRecord, writeJsonAtomic, archiveRecord } = require('./lib/persistence.cjs');
 const { acquireLock, releaseLock } = require('./lib/file-lock.cjs');
 const { checkJournalGate } = require('./lib/journal-gate.cjs');
-const { parseAndValidateSignedTx, persistPendingEntry, readPendingJournal, clearPendingJournal } = require('./lib/transaction-journal.cjs');
+const { parseAndValidateSignedTx, persistPendingEntry, readPendingJournal, clearPendingJournal, validateDeploymentTransaction, validateBindingTransaction } = require('./lib/transaction-journal.cjs');
 const { verifyAllDeployments } = require('./lib/deployment-verifier.cjs');
 const { loadSharedMapping } = require('./lib/shared-loader.cjs');
 
@@ -810,10 +810,36 @@ async function runRelease({
         // new one. This preserves the nonce and txHash, eliminating duplicate
         // transaction risk after a crash between journaling and broadcast.
         // Validate the signed transaction before rebroadcasting.
-        const parsed = parseAndValidateSignedTx(signedTx, chainId, {
-          expectedTxHash: entry.txHash,
-          expectedTo: null, // contract creation
-        });
+        const expectedInitcode = (journal.status === 'ok' && journal.entry) ? journal.entry.expectedData : null;
+        const parsed = validateDeploymentTransaction(signedTx, journal.entry, null, expectedInitcode);
+        // Receipt-first: check if already mined before rebroadcasting.
+        const existingReceipt = await probes.receipt(entry.txHash);
+        if (existingReceipt && existingReceipt.status === 1) {
+          // Already confirmed — reconcile without rebroadcast.
+          record.contracts[name] = {
+            address: existingReceipt.contractAddress,
+            txHash: entry.txHash,
+            blockNumber: existingReceipt.blockNumber,
+            gasLimit: entry.gasLimit,
+            status: 'confirmed',
+          };
+          syncTokens(record, config.tokenConfig);
+          record.updatedAt = new Date().toISOString();
+          recordIo.write(recordFile, record);
+          reuseNotes.push(`${name}: already mined, reconciled without rebroadcast`);
+          stderr.write(`\\n${name}: already mined, reconciled without rebroadcast\\n`);
+          const opId = journal.entry.operationId;
+          clearPendingJournal(recordFile, opId, entry.txHash);
+          continue;
+        }
+        // Check if transaction is known but pending.
+        const knownTx = await probes.transaction(entry.txHash);
+        if (knownTx) {
+          // Transaction is known but not mined — preserve pending state, do not replace.
+          stderr.write(`\\n${name}: transaction known but pending, preserving state\\n`);
+          continue;
+        }
+        // Only rebroadcast if transaction is unknown.
         const broadcast = await rebroadcastTx(signedTx);
         const receipt = broadcast.receipt;
         validateReceipt(entry.txHash, receipt);
@@ -853,8 +879,8 @@ async function runRelease({
         recordIo.write(recordFile, record);
         reuseNotes.push(`${name}: rebroadcast journaled transaction ${entry.txHash} (no new transaction)`);
         stderr.write(`\n${name}: rebroadcast journaled transaction ${entry.txHash}\n`);
-        const journal = readPendingJournal(recordFile);
-        const opId = (journal.status === 'ok' && journal.entry) ? journal.entry.operationId : null;
+        const j2 = readPendingJournal(recordFile);
+        const opId = (j2.status === 'ok' && j2.entry) ? j2.entry.operationId : null;
         clearPendingJournal(recordFile, opId, entry.txHash);
       } else {
         record.contracts[name] = await reconcilePendingEntry(name, entry, probes);
