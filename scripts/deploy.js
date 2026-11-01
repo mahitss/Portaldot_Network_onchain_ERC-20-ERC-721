@@ -40,6 +40,7 @@ const { runPreflight } = require('./lib/preflight.cjs');
 const { buildLiveProbes } = require('./lib/probes.cjs');
 const { readJsonRecord, writeJsonAtomic, archiveRecord } = require('./lib/persistence.cjs');
 const { acquireLock, releaseLock } = require('./lib/file-lock.cjs');
+const { checkJournalGate } = require('./lib/journal-gate.cjs');
 const { parseAndValidateSignedTx, persistPendingEntry, readPendingJournal, clearPendingJournal } = require('./lib/transaction-journal.cjs');
 const { verifyAllDeployments } = require('./lib/deployment-verifier.cjs');
 const { loadSharedMapping } = require('./lib/shared-loader.cjs');
@@ -648,6 +649,11 @@ async function runRelease({
   // concurrent processes from signing different operations with the same nonce.
   const lock = acquireLock(recordFile);
   try {
+    // SHARED JOURNAL GATE: block all unsafe paths if an unresolved journal exists.
+    const gate = checkJournalGate(recordFile, recordIo);
+    if (gate.blocked) {
+      throw new Error(gate.reason);
+    }
     // JOURNAL-FIRST: read and validate the journal before any new signing.
     const existingJournal = readPendingJournal(recordFile);
     if (existingJournal.status === 'ok' && existingJournal.entry) {
