@@ -810,8 +810,16 @@ async function runRelease({
         // new one. This preserves the nonce and txHash, eliminating duplicate
         // transaction risk after a crash between journaling and broadcast.
         // Validate the signed transaction before rebroadcasting.
-        const expectedInitcode = (journal.status === 'ok' && journal.entry) ? journal.entry.expectedData : null;
-        const parsed = validateDeploymentTransaction(signedTx, journal.entry, null, expectedInitcode);
+        // Reconstruct expected initcode independently from the artifact.
+        // For now, use the journal's expectedData as a fallback but require
+        // it to be present (not null).
+        const expectedInitcode = (journal.status === 'ok' && journal.entry && journal.entry.expectedData)
+          ? journal.entry.expectedData
+          : null;
+        if (!expectedInitcode) {
+          throw new Error('cannot reconstruct expected initcode for deployment validation');
+        }
+        const parsed = validateDeploymentTransaction(signedTx, journal.entry, journal.entry.expectedSender, expectedInitcode);
         // Receipt-first: check if already mined before rebroadcasting.
         const existingReceipt = await probes.receipt(entry.txHash);
         if (existingReceipt && existingReceipt.status === 1) {

@@ -412,7 +412,8 @@ async function runBinding({
         // Validate the signed transaction before rebroadcasting.
         const validationJournal = journal;
         const expectedCalldata = (validationJournal.status === 'ok' && validationJournal.entry) ? validationJournal.entry.expectedData : null;
-        const parsed = validateBindingTransaction(signedTx, validationJournal.entry, null, null, null);
+        const vj = validationJournal.entry;
+        const parsed = validateBindingTransaction(signedTx, vj, vj.expectedSender, vj.expectedTo, vj.expectedData);
         // Receipt-first: check if already mined.
         const existingReceipt = await probes.receipt(entry.txHash);
         if (existingReceipt && existingReceipt.status === 1) {
