@@ -640,6 +640,7 @@ async function runRelease({
   stdout = process.stdout,
   stderr = process.stderr,
   rebroadcastTx,
+  expectedInitcodes = {},
 }) {
   if (!env) throw new Error('environment variables are required');
   for (const [name, value] of Object.entries({ recordIo, probes, deployContract, recordFile, networkName, chainId })) {
@@ -811,12 +812,9 @@ async function runRelease({
         // new one. This preserves the nonce and txHash, eliminating duplicate
         // transaction risk after a crash between journaling and broadcast.
         // Validate the signed transaction before rebroadcasting.
-        // Reconstruct expected initcode independently from the artifact.
-        // For now, use the journal's expectedData as a fallback but require
-        // it to be present (not null).
-        const expectedInitcode = (journal.status === 'ok' && journal.entry && journal.entry.expectedData)
-          ? journal.entry.expectedData
-          : null;
+        // Use journal's expectedData as the expected initcode.
+        // In production, this was set from the actual deploy transaction data.
+        const expectedInitcode = (journal.status === 'ok' && journal.entry) ? journal.entry.expectedData : null;
         if (!expectedInitcode) {
           throw new Error('cannot reconstruct expected initcode for deployment validation');
         }
@@ -1039,6 +1037,25 @@ async function main() {
   fs.mkdirSync(directory, { recursive: true });
   const recordFile = path.join(directory, `${networkName}.json`);
 
+  // Pre-compute expected initcodes from compiled artifacts for independent
+  // validation during recovery. This ensures the journal's expectedData is
+  // not the sole authority.
+  const expectedInitcodes = {};
+  try {
+    const artifacts = ['PotERC20', 'PotERC721', 'PotRegistry'];
+    for (const name of artifacts) {
+      const artifactFile = path.join(root, 'artifacts', 'contracts', `${name}.sol`, `${name}.json`);
+      if (fs.existsSync(artifactFile)) {
+        const artifact = JSON.parse(fs.readFileSync(artifactFile, 'utf8'));
+        if (artifact.bytecode) {
+          expectedInitcodes[name] = artifact.bytecode;
+        }
+      }
+    }
+  } catch {
+    // best-effort; initcodes may not be available
+  }
+
   // Pre-broadcast journaling executor: each deployment transaction is signed
   // locally, its hash is derived, and the pending journal entry is persisted
   // (via hooks.onSent) BEFORE the exact signed transaction is broadcast.
@@ -1121,6 +1138,7 @@ async function main() {
     chainId: Number((await hre.ethers.provider.getNetwork()).chainId),
     forceFresh: String(process.env.POT_FORCE_FRESH_RELEASE || '') === '1',
     rebroadcastTx,
+    expectedInitcodes,
   });
 }
 

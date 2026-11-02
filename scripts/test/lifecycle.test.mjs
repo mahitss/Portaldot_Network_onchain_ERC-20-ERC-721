@@ -1341,6 +1341,7 @@ test('Objective B: crash before broadcast - journaled pending entry rebroadcast 
     networkName: NETWORK,
     chainId: CHAIN_ID,
     rebroadcastTx,
+    expectedInitcodes: { PotERC20: '0x608060405234801561001057600080fd5b50' },
   });
   assert.equal(sent2, 2, 'only PotERC721 and PotRegistry deployed (PotERC20 rebroadcast from journal, not redeployed)');
   const final = recordIo.state();
@@ -1526,6 +1527,7 @@ test('Objective B: broadcast succeeds but receipt wait fails - retry uses same t
     networkName: NETWORK,
     chainId: CHAIN_ID,
     rebroadcastTx,
+    expectedInitcodes: { PotERC20: '0x608060405234801561001057600080fd5b50' },
   });
   assert.equal(sent2, 2, 'only PotERC721 and PotRegistry deployed (PotERC20 reconciled from rebroadcast)');
   const final = recordIo.state();
