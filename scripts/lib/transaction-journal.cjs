@@ -48,8 +48,19 @@ function parseAndValidateSignedTx(signed, expectedChainId, options = {}) {
     }
   }
   if (options.expectedNonce !== undefined && options.expectedNonce !== null) {
-    if (Number(parsed.nonce) !== Number(options.expectedNonce)) {
-      throw new Error('signed transaction nonce ' + parsed.nonce + ' does not match expected ' + options.expectedNonce);
+    // Strict nonce comparison without Number() coercion.
+    const parsedNonce = parsed.nonce;
+    const expectedNonce = options.expectedNonce;
+    // Both must be integers.
+    if (typeof parsedNonce !== 'number' && typeof parsedNonce !== 'bigint') {
+      throw new Error('signed transaction nonce is not a valid integer');
+    }
+    if (typeof expectedNonce !== 'number' && typeof expectedNonce !== 'bigint' && typeof expectedNonce !== 'string') {
+      throw new Error('expected nonce is not a valid integer');
+    }
+    // Compare as strings to avoid coercion.
+    if (String(parsedNonce) !== String(expectedNonce)) {
+      throw new Error('signed transaction nonce ' + parsedNonce + ' does not match expected ' + expectedNonce);
     }
   }
   if (options.expectedTo !== undefined) {
