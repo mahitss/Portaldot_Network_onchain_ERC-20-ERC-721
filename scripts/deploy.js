@@ -822,7 +822,12 @@ async function runRelease({
         const parsed = validateDeploymentTransaction(signedTx, journal.entry, journal.entry.expectedSender, expectedInitcode);
         // Receipt-first: check if already mined before rebroadcasting.
         const existingReceipt = await probes.receipt(entry.txHash);
-        if (existingReceipt && existingReceipt.status === 1) {
+        if (existingReceipt && Number(existingReceipt.status) === 0) {
+          // Failed receipt — terminal, preserve journal, do not rebroadcast.
+          stderr.write(`\\n${name}: transaction mined but FAILED (status 0); preserving journal for manual recovery\\n`);
+          continue;
+        }
+        if (existingReceipt && Number(existingReceipt.status) === 1) {
           // Already confirmed — reconcile without rebroadcast.
           record.contracts[name] = {
             address: existingReceipt.contractAddress,
@@ -1091,7 +1096,8 @@ async function main() {
   };
 
   const rebroadcastTx = async (signed) => {
-    const parsed = parseAndValidateSignedTx(signed, Number((await hre.ethers.provider.getNetwork()).chainId));
+    // Full validation is performed by runRelease before calling this helper.
+    // This helper only broadcasts and waits for the receipt.
     const broadcast = await provider.broadcastTransaction(signed);
     const receipt = await broadcast.wait();
     return { receipt, address: broadcast.contractAddress };

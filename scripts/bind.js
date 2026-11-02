@@ -416,7 +416,11 @@ async function runBinding({
         const parsed = validateBindingTransaction(signedTx, vj, vj.expectedSender, vj.expectedTo, vj.expectedData);
         // Receipt-first: check if already mined.
         const existingReceipt = await probes.receipt(entry.txHash);
-        if (existingReceipt && existingReceipt.status === 1) {
+        if (existingReceipt && Number(existingReceipt.status) === 0) {
+          stderr.write(`\\nbinding for ${entry.token}: transaction mined but FAILED (status 0); preserving journal for manual recovery\\n`);
+          continue;
+        }
+        if (existingReceipt && Number(existingReceipt.status) === 1) {
           const confirmedEntry = { ...entry, blockNumber: existingReceipt.blockNumber, status: 'confirmed' };
           upsertBinding(record, confirmedEntry);
           record.updatedAt = new Date().toISOString();
@@ -742,7 +746,7 @@ async function main() {
     ]);
 
   const rebroadcastBindTx = async (signed) => {
-    const parsed = parseAndValidateSignedTx(signed, Number((await hre.ethers.provider.getNetwork()).chainId));
+    // Full validation is performed by runBinding before calling this helper.
     const broadcast = await provider.broadcastTransaction(signed);
     const receipt = await broadcast.wait();
     return { receipt, address: broadcast.contractAddress };

@@ -22,7 +22,10 @@ function parseAndValidateSignedTx(signed, expectedChainId, options = {}) {
     throw new Error('cannot parse signed transaction: ' + error.message);
   }
   const chainId = expectedChainId || PORTALDOT_CHAIN_ID;
-  if (parsed.chainId !== undefined && BigInt(parsed.chainId) !== BigInt(chainId)) {
+  if (parsed.chainId === undefined || parsed.chainId === null) {
+    throw new Error('signed transaction has no chain ID');
+  }
+  if (BigInt(parsed.chainId) !== BigInt(chainId)) {
     throw new Error('signed transaction chainId ' + parsed.chainId + ' does not match expected chainId ' + chainId);
   }
   if (parsed.nonce === undefined || parsed.nonce === null) {
@@ -112,6 +115,41 @@ function readPendingJournal(recordFile) {
     }
     if (parsed.operation !== 'deploy' && parsed.operation !== 'bind') {
       return { status: 'malformed', entry: null, error: 'invalid operation type: ' + parsed.operation };
+    }
+    // Validate expectedTo.
+    if (parsed.expectedTo !== null && parsed.expectedTo !== undefined) {
+      if (!/^0x[0-9a-fA-F]{40}$/.test(parsed.expectedTo)) {
+        return { status: 'malformed', entry: null, error: 'invalid expected destination' };
+      }
+    } else if (parsed.operation === 'bind') {
+      return { status: 'malformed', entry: null, error: 'binding journal missing expected destination (registry)' };
+    }
+    // Validate expectedValue.
+    if (parsed.expectedValue === undefined || parsed.expectedValue === null) {
+      return { status: 'malformed', entry: null, error: 'missing expected value' };
+    }
+    // Validate expectedData.
+    if (!parsed.expectedData || !/^0x[0-9a-fA-F]*$/.test(parsed.expectedData)) {
+      return { status: 'malformed', entry: null, error: 'missing or invalid expected data' };
+    }
+    // Validate createdAt.
+    if (!parsed.createdAt || typeof parsed.createdAt !== 'string') {
+      return { status: 'malformed', entry: null, error: 'missing createdAt' };
+    }
+    // Validate status.
+    if (parsed.status !== 'pending') {
+      return { status: 'malformed', entry: null, error: 'invalid status (expected pending)' };
+    }
+    // Operation-specific validation.
+    if (parsed.operation === 'deploy') {
+      if (!parsed.params || !parsed.params.artifact) {
+        return { status: 'malformed', entry: null, error: 'deployment journal missing artifact name' };
+      }
+    }
+    if (parsed.operation === 'bind') {
+      if (!parsed.params || !parsed.params.token || !parsed.params.nativeAccountHash) {
+        return { status: 'malformed', entry: null, error: 'binding journal missing required params' };
+      }
     }
     return { status: 'ok', entry: parsed, error: null };
   } catch (error) {
