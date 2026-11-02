@@ -42,6 +42,7 @@ const { buildLiveProbes } = require('./lib/probes.cjs');
 const { readJsonRecord, writeJsonAtomic, archiveRecord } = require('./lib/persistence.cjs');
 const { acquireLock, releaseLock } = require('./lib/file-lock.cjs');
 const { checkJournalGate } = require('./lib/journal-gate.cjs');
+const { classifyRecoveryState, MINED_SUCCESS, MINED_FAILURE, KNOWN_PENDING, UNKNOWN, AMBIGUOUS } = require('./lib/recovery-classifier.cjs');
 const { parseAndValidateSignedTx, persistPendingEntry, readPendingJournal, clearPendingJournal, validateDeploymentTransaction, validateBindingTransaction } = require('./lib/transaction-journal.cjs');
 const { verifyAllDeployments } = require('./lib/deployment-verifier.cjs');
 const { loadSharedMapping } = require('./lib/shared-loader.cjs');
@@ -416,11 +417,13 @@ async function runBinding({
         const parsed = validateBindingTransaction(signedTx, vj, vj.expectedSender, vj.expectedTo, vj.expectedData);
         // Receipt-first: check if already mined.
         const existingReceipt = await probes.receipt(entry.txHash);
-        if (existingReceipt && Number(existingReceipt.status) === 0) {
-          stderr.write(`\\nbinding for ${entry.token}: transaction mined but FAILED (status 0); preserving journal for manual recovery\\n`);
+        const knownTx = await probes.transaction(entry.txHash);
+        const state = classifyRecoveryState(existingReceipt, knownTx, null);
+        if (state === MINED_FAILURE) {
+          stderr.write(`\\nbinding for ${entry.token}: transaction mined but FAILED; preserving journal for manual recovery\\n`);
           continue;
         }
-        if (existingReceipt && Number(existingReceipt.status) === 1) {
+        if (state === MINED_SUCCESS) {
           const confirmedEntry = { ...entry, blockNumber: existingReceipt.blockNumber, status: 'confirmed' };
           upsertBinding(record, confirmedEntry);
           record.updatedAt = new Date().toISOString();
@@ -436,9 +439,12 @@ async function runBinding({
           continue;
         }
         // Check if transaction is known but pending.
-        const knownTx = await probes.transaction(entry.txHash);
-        if (knownTx) {
+        if (state === KNOWN_PENDING) {
           stderr.write(`\\nbinding for ${entry.token}: transaction known but pending, preserving state\\n`);
+          continue;
+        }
+        if (state === AMBIGUOUS) {
+          stderr.write(`\\nbinding for ${entry.token}: recovery state ambiguous; preserving journal\\n`);
           continue;
         }
         const broadcast = await rebroadcastTx(signedTx);

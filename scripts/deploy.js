@@ -41,6 +41,7 @@ const { buildLiveProbes } = require('./lib/probes.cjs');
 const { readJsonRecord, writeJsonAtomic, archiveRecord } = require('./lib/persistence.cjs');
 const { acquireLock, releaseLock } = require('./lib/file-lock.cjs');
 const { checkJournalGate } = require('./lib/journal-gate.cjs');
+const { classifyRecoveryState, MINED_SUCCESS, MINED_FAILURE, KNOWN_PENDING, UNKNOWN, AMBIGUOUS } = require('./lib/recovery-classifier.cjs');
 const { parseAndValidateSignedTx, persistPendingEntry, readPendingJournal, clearPendingJournal, validateDeploymentTransaction, validateBindingTransaction } = require('./lib/transaction-journal.cjs');
 const { verifyAllDeployments } = require('./lib/deployment-verifier.cjs');
 const { loadSharedMapping } = require('./lib/shared-loader.cjs');
@@ -822,12 +823,14 @@ async function runRelease({
         const parsed = validateDeploymentTransaction(signedTx, journal.entry, journal.entry.expectedSender, expectedInitcode);
         // Receipt-first: check if already mined before rebroadcasting.
         const existingReceipt = await probes.receipt(entry.txHash);
-        if (existingReceipt && Number(existingReceipt.status) === 0) {
-          // Failed receipt — terminal, preserve journal, do not rebroadcast.
-          stderr.write(`\\n${name}: transaction mined but FAILED (status 0); preserving journal for manual recovery\\n`);
+        const knownTx = await probes.transaction(entry.txHash);
+        const rpcError = null; // would be set if query threw
+        const state = classifyRecoveryState(existingReceipt, knownTx, rpcError);
+        if (state === MINED_FAILURE) {
+          stderr.write(`\\n${name}: transaction mined but FAILED; preserving journal for manual recovery\\n`);
           continue;
         }
-        if (existingReceipt && Number(existingReceipt.status) === 1) {
+        if (state === MINED_SUCCESS) {
           // Already confirmed — reconcile without rebroadcast.
           record.contracts[name] = {
             address: existingReceipt.contractAddress,
@@ -845,11 +848,14 @@ async function runRelease({
           clearPendingJournal(recordFile, opId, entry.txHash);
           continue;
         }
-        // Check if transaction is known but pending.
-        const knownTx = await probes.transaction(entry.txHash);
-        if (knownTx) {
+        // Check if transaction is known but pending (already queried above).
+        if (state === KNOWN_PENDING) {
           // Transaction is known but not mined — preserve pending state, do not replace.
           stderr.write(`\\n${name}: transaction known but pending, preserving state\\n`);
+          continue;
+        }
+        if (state === AMBIGUOUS) {
+          stderr.write(`\\n${name}: recovery state ambiguous; preserving journal\\n`);
           continue;
         }
         // Only rebroadcast if transaction is unknown.
