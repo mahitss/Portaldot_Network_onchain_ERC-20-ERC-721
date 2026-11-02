@@ -42,6 +42,7 @@ const { buildLiveProbes } = require('./lib/probes.cjs');
 const { readJsonRecord, writeJsonAtomic, archiveRecord } = require('./lib/persistence.cjs');
 const { acquireLock, releaseLock } = require('./lib/file-lock.cjs');
 const { checkJournalGate } = require('./lib/journal-gate.cjs');
+const { classifyRecoveryState, MINED_SUCCESS, MINED_FAILURE, KNOWN_PENDING, UNKNOWN, AMBIGUOUS } = require('./lib/recovery-classifier.cjs');
 const { parseAndValidateSignedTx, persistPendingEntry, readPendingJournal, clearPendingJournal, validateDeploymentTransaction, validateBindingTransaction } = require('./lib/transaction-journal.cjs');
 const { verifyAllDeployments } = require('./lib/deployment-verifier.cjs');
 const { loadSharedMapping } = require('./lib/shared-loader.cjs');
@@ -412,10 +413,17 @@ async function runBinding({
         // Validate the signed transaction before rebroadcasting.
         const validationJournal = journal;
         const expectedCalldata = (validationJournal.status === 'ok' && validationJournal.entry) ? validationJournal.entry.expectedData : null;
-        const parsed = validateBindingTransaction(signedTx, validationJournal.entry, null, null, null);
+        const vj = validationJournal.entry;
+        const parsed = validateBindingTransaction(signedTx, vj, vj.expectedSender, vj.expectedTo, vj.expectedData);
         // Receipt-first: check if already mined.
         const existingReceipt = await probes.receipt(entry.txHash);
-        if (existingReceipt && existingReceipt.status === 1) {
+        const knownTx = await probes.transaction(entry.txHash);
+        const state = classifyRecoveryState(existingReceipt, knownTx, null);
+        if (state === MINED_FAILURE) {
+          stderr.write(`\\nbinding for ${entry.token}: transaction mined but FAILED; preserving journal for manual recovery\\n`);
+          continue;
+        }
+        if (state === MINED_SUCCESS) {
           const confirmedEntry = { ...entry, blockNumber: existingReceipt.blockNumber, status: 'confirmed' };
           upsertBinding(record, confirmedEntry);
           record.updatedAt = new Date().toISOString();
@@ -431,9 +439,12 @@ async function runBinding({
           continue;
         }
         // Check if transaction is known but pending.
-        const knownTx = await probes.transaction(entry.txHash);
-        if (knownTx) {
+        if (state === KNOWN_PENDING) {
           stderr.write(`\\nbinding for ${entry.token}: transaction known but pending, preserving state\\n`);
+          continue;
+        }
+        if (state === AMBIGUOUS) {
+          stderr.write(`\\nbinding for ${entry.token}: recovery state ambiguous; preserving journal\\n`);
           continue;
         }
         const broadcast = await rebroadcastTx(signedTx);
@@ -741,7 +752,7 @@ async function main() {
     ]);
 
   const rebroadcastBindTx = async (signed) => {
-    const parsed = parseAndValidateSignedTx(signed, Number((await hre.ethers.provider.getNetwork()).chainId));
+    // Full validation is performed by runBinding before calling this helper.
     const broadcast = await provider.broadcastTransaction(signed);
     const receipt = await broadcast.wait();
     return { receipt, address: broadcast.contractAddress };
