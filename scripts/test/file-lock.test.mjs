@@ -80,14 +80,17 @@ test('file-lock: wrong owner cannot release lock', async () => {
   const lockMod = await import('../lib/file-lock.cjs');
   const file = tempFile();
   const lock1 = lockMod.acquireLock(file);
-  // Try to release with a different token
-  const fakeToken = { pid: 99999, token: 'fake-token', createdAt: new Date().toISOString() };
-  // Manually call releaseLock with wrong token by reading the module's internal
-  // Instead, just verify the lock file still exists after a failed release attempt
-  // by trying to acquire again (should fail because lock1 still holds it)
-  assert.throws(() => lockMod.acquireLock(file), /already running|cannot acquire/);
+  const lockPath = file + '.lock';
+  // Attempt to release with a foreign token
+  const foreignToken = { pid: 99999, token: 'foreign-token', createdAt: new Date().toISOString() };
+  lockMod.releaseLock(lockPath, foreignToken);
+  // Lock should still be held by the original owner
+  assert.ok(fs.existsSync(lockPath), 'lock should still exist after foreign release attempt');
+  assert.throws(() => lockMod.acquireLock(file), /already running|cannot acquire/, 'lock should still be held');
+  // Original owner can still release
   lock1.release();
-  // Now it should be releasable
+  assert.ok(!fs.existsSync(lockPath), 'lock should be released by original owner');
+  // Can re-acquire
   const lock2 = lockMod.acquireLock(file);
   assert.ok(lock2.acquired);
   lock2.release();
