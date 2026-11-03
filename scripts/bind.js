@@ -22,7 +22,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { Transaction } = require('ethers');
+const { Transaction, Interface } = require('ethers');
 const {
   KIND_ERC20,
   KIND_ERC721,
@@ -410,11 +410,31 @@ async function runBinding({
         // Rebroadcast the exact same signed transaction instead of signing a
         // new one. This preserves the nonce and txHash, eliminating duplicate
         // transaction risk after a crash between journaling and broadcast.
-        // Validate the signed transaction before rebroadcasting.
-        const validationJournal = journal;
-        const expectedCalldata = (validationJournal.status === 'ok' && validationJournal.entry) ? validationJournal.entry.expectedData : null;
-        const vj = validationJournal.entry;
-        const parsed = validateBindingTransaction(signedTx, vj, vj.expectedSender, vj.expectedTo, vj.expectedData);
+        // Validate the signed transaction before rebroadcasting using
+        // independently reconstructed binding intent (never journal-sourced
+        // expected sender, registry, or calldata).
+        const registryArtifact = requireRegistryArtifact();
+        const registryInterface = new Interface(registryArtifact.abi);
+        // Find the intended call for this entry's token from the record.
+        const tokenEntryKey = entry.token.toLowerCase() === String(record.tokens.erc20.address).toLowerCase() ? 'erc20' : 'erc721';
+        const intendedCall = intendedCalls.find((c) => c.tokens === tokenEntryKey);
+        if (!intendedCall) {
+          throw new Error('cannot reconstruct binding intent for ' + entry.token + ': no intended call found');
+        }
+        const expectedCalldata = registryInterface.encodeFunctionData('bind', [
+          entry.token,
+          intendedCall.tokenKind,
+          intendedCall.nativeKind,
+          intendedCall.nativeId,
+          intendedCall.nativeDecimals,
+          intendedCall.evmDecimals,
+          config.nativeAccountHash,
+        ]);
+        // Independently derived identity, never from the journal.
+        const expectedSigner = signerAddress;
+        const expectedRegistry = recordedRegistry;
+        const vj = journal.entry;
+        const parsed = validateBindingTransaction(signedTx, vj, expectedSigner, expectedRegistry, expectedCalldata, vj.nonce);
         // Receipt-first: check if already mined.
         const existingReceipt = await probes.receipt(entry.txHash);
         const knownTx = await probes.transaction(entry.txHash);

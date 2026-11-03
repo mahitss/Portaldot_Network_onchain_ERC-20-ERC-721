@@ -20,7 +20,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { Transaction } = require('ethers');
+const { Transaction, Interface } = require('ethers');
 const {
   CHAIN_ID,
   MAX_CODE_SIZE_BYTES,
@@ -811,14 +811,25 @@ async function runRelease({
         // Rebroadcast the exact same signed transaction instead of signing a
         // new one. This preserves the nonce and txHash, eliminating duplicate
         // transaction risk after a crash between journaling and broadcast.
-        // Validate the signed transaction before rebroadcasting.
-        // Use journal's expectedData as the expected initcode.
-        // In production, this was set from the actual deploy transaction data.
-        const expectedInitcode = (journal.status === 'ok' && journal.entry) ? journal.entry.expectedData : null;
+        // Validate the signed transaction before rebroadcasting using
+        // independently reconstructed initcode (never journal-sourced expectedData).
+        const expectedInitcode = expectedInitcodes[name] || null;
         if (!expectedInitcode) {
-          throw new Error('cannot reconstruct expected initcode for deployment validation');
+          throw new Error('cannot reconstruct expected initcode for deployment validation of ' + name + ': no artifact initcode available');
         }
-        const parsed = validateDeploymentTransaction(signedTx, journal.entry, journal.entry.expectedSender, expectedInitcode);
+        // Journal's expectedData must match independently reconstructed initcode.
+        // Journal data can never authorize a different transaction.
+        if (
+          journal.status === 'ok' &&
+          journal.entry &&
+          journal.entry.expectedData &&
+          journal.entry.expectedData.toLowerCase() !== expectedInitcode.toLowerCase()
+        ) {
+          throw new Error(
+            'journal expectedData for ' + name + ' does not match independently reconstructed initcode; refusing to rebroadcast tampered journal'
+          );
+        }
+        const parsed = validateDeploymentTransaction(signedTx, journal.entry, journal.entry.expectedSender, expectedInitcode, journal.entry.nonce);
         // Receipt-first: check if already mined before rebroadcasting.
         const existingReceipt = await probes.receipt(entry.txHash);
         const knownTx = await probes.transaction(entry.txHash);
@@ -1038,22 +1049,35 @@ async function main() {
   const recordFile = path.join(directory, `${networkName}.json`);
 
   // Pre-compute expected initcodes from compiled artifacts for independent
-  // validation during recovery. This ensures the journal's expectedData is
-  // not the sole authority.
+  // validation during recovery. Full initcode = creation bytecode +
+  // ABI-encoded constructor arguments. This ensures the journal's
+  // expectedData is not the sole authority.
   const expectedInitcodes = {};
   try {
-    const artifacts = ['PotERC20', 'PotERC721', 'PotRegistry'];
-    for (const name of artifacts) {
+    const abiCoder = new AbiCoder();
+    const artifactNames = ['PotERC20', 'PotERC721', 'PotRegistry'];
+    for (const name of artifactNames) {
       const artifactFile = path.join(root, 'artifacts', 'contracts', `${name}.sol`, `${name}.json`);
-      if (fs.existsSync(artifactFile)) {
-        const artifact = JSON.parse(fs.readFileSync(artifactFile, 'utf8'));
-        if (artifact.bytecode) {
-          expectedInitcodes[name] = artifact.bytecode;
-        }
+      if (!fs.existsSync(artifactFile)) {
+        throw new Error('cannot reconstruct initcode for ' + name + ': artifact file not found');
       }
+      const artifact = JSON.parse(fs.readFileSync(artifactFile, 'utf8'));
+      if (!artifact.bytecode) {
+        throw new Error('cannot reconstruct initcode for ' + name + ': artifact bytecode is missing');
+      }
+      if (!artifact.abi) {
+        throw new Error('cannot reconstruct initcode for ' + name + ': artifact ABI is missing');
+      }
+      const artifactInfo = (config.artifacts || []).find((a) => a.name === name);
+      if (!artifactInfo) {
+        throw new Error('cannot reconstruct initcode for ' + name + ': no artifact config in preflight');
+      }
+      const iface = new Interface(artifact.abi);
+      const encodedArgs = iface.encodeDeploy(artifactInfo.args || []);
+      expectedInitcodes[name] = artifact.bytecode + encodedArgs.slice(2);
     }
-  } catch {
-    // best-effort; initcodes may not be available
+  } catch (error) {
+    throw new Error('cannot reconstruct deployment initcodes: ' + error.message);
   }
 
   // Pre-broadcast journaling executor: each deployment transaction is signed
