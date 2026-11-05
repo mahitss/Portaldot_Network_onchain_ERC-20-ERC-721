@@ -13,7 +13,7 @@ const KNOWN_PENDING = 'KNOWN_PENDING';
 const UNKNOWN = 'UNKNOWN';
 const AMBIGUOUS = 'AMBIGUOUS';
 
-function classifyRecoveryState(receipt, tx, rpcError) {
+function classifyRecoveryState(receipt, tx, rpcError, expectedTxHash) {
   // RPC error or exception → ambiguous.
   if (rpcError) {
     return AMBIGUOUS;
@@ -24,26 +24,38 @@ function classifyRecoveryState(receipt, tx, rpcError) {
   }
   // Receipt exists.
   if (receipt && typeof receipt === 'object') {
-    if (receipt.transactionHash === undefined && receipt.status === undefined) {
-      // Malformed receipt (no status, no hash).
+    // Transaction hash must match the journaled hash exactly (case-insensitive hex).
+    if (receipt.transactionHash !== undefined) {
+      if (expectedTxHash !== undefined && expectedTxHash !== null) {
+        if (String(receipt.transactionHash).toLowerCase() !== String(expectedTxHash).toLowerCase()) {
+          return AMBIGUOUS; // receipt does not belong to this transaction
+        }
+      } else if (!/^0x[0-9a-fA-F]{64}$/.test(String(receipt.transactionHash))) {
+        return AMBIGUOUS;
+      }
+    } else {
+      // No transaction hash in receipt — cannot prove identity.
       return AMBIGUOUS;
     }
-    // Check status without Number() coercion.
+    // Strict status: 1/'1' → success, 0/'0' → failure, anything else → ambiguous.
     const status = receipt.status;
-    if (status === 1 || status === '1' || status === true) {
+    if (status === 1 || status === '1' || status === true || status === 1n) {
+      if (!isMinedReceipt(receipt)) return AMBIGUOUS;
       return MINED_SUCCESS;
     }
-    if (status === 0 || status === '0' || status === false) {
+    if (status === 0 || status === '0' || status === false || status === 0n) {
+      if (!isMinedReceipt(receipt)) return AMBIGUOUS;
       return MINED_FAILURE;
-    }
-    // Missing or unrecognized status → ambiguous.
-    if (status === undefined || status === null) {
-      return AMBIGUOUS;
     }
     return AMBIGUOUS;
   }
   // No receipt. Check if transaction is known.
   if (tx && typeof tx === 'object' && tx.hash) {
+    if (expectedTxHash !== undefined && expectedTxHash !== null) {
+      if (String(tx.hash).toLowerCase() !== String(expectedTxHash).toLowerCase()) {
+        return AMBIGUOUS; // a transaction with a different hash is known — cannot trust it
+      }
+    }
     return KNOWN_PENDING;
   }
   // Both absent and no RPC error → unknown (safe to rebroadcast).
@@ -52,6 +64,12 @@ function classifyRecoveryState(receipt, tx, rpcError) {
   }
   // Anything else → ambiguous.
   return AMBIGUOUS;
+}
+
+// A mined receipt must carry a valid, non-negative safe-integer block number.
+function isMinedReceipt(receipt) {
+  const bn = receipt.blockNumber;
+  return typeof bn === 'number' && Number.isSafeInteger(bn) && bn >= 0;
 }
 
 module.exports = {

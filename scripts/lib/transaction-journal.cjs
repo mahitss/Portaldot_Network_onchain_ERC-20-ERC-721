@@ -184,8 +184,8 @@ function readPendingJournal(recordFile) {
     }
     // Validate status.
     if (parsed.status === 'failed') {
-      // Terminal failure evidence: receipt evidence must be present and match
-      // the journaled transaction hash.
+      // Terminal failure evidence: receipt evidence must be present, canonical,
+      // and match the journaled transaction hash.
       if (!parsed.receipt || typeof parsed.receipt !== 'object') {
         return { status: 'malformed', entry: null, error: 'terminal failure journal is missing receipt evidence' };
       }
@@ -196,12 +196,16 @@ function readPendingJournal(recordFile) {
       if (!Number.isSafeInteger(parsed.receipt.blockNumber) || parsed.receipt.blockNumber < 0) {
         return { status: 'malformed', entry: null, error: 'terminal failure receipt has an invalid block number' };
       }
-      if (!Number.isSafeInteger(parsed.receipt.status) || parsed.receipt.status !== 0) {
+      const rs = parsed.receipt.status;
+      const definiteFailure = rs === 0 || rs === '0' || rs === false || rs === 0n;
+      if (!definiteFailure) {
         return { status: 'malformed', entry: null, error: 'terminal failure receipt status is not a known failure value' };
       }
       if (!parsed.failedAt || typeof parsed.failedAt !== 'string') {
         return { status: 'malformed', entry: null, error: 'terminal failure journal is missing failedAt' };
       }
+      // Canonicalize: status is always stored as 0 (number) for consumers reading this.
+      parsed.receipt.status = 0;
       return { status: 'terminal_failure', entry: parsed, error: null };
     }
     if (parsed.status !== 'pending') {
@@ -225,17 +229,54 @@ function readPendingJournal(recordFile) {
 }
 
 function fsyncDirectory(directory) {
+  let dirFd = null;
   try {
-    const dirFd = fs.openSync(directory, 'r');
-    try {
-      fs.fsyncSync(dirFd);
-    } finally {
-      fs.closeSync(dirFd);
+    dirFd = fs.openSync(directory, 'r');
+  } catch (error) {
+    if (isKnownUnsupportedSyncError(error)) {
+      return { status: 'unsupported', error: error && error.message ? error.message : String(error) };
     }
-  } catch {
-    // directory fsync unsupported on this platform; link still provides
-    // atomic publication, durability is best-effort.
+    throw new Error('cannot open directory for synchronization: ' + directory + ' (' + (error && error.message ? error.message : String(error)) + ')');
   }
+  try {
+    fs.fsyncSync(dirFd);
+  } catch (error) {
+    if (isKnownUnsupportedSyncError(error)) {
+      return { status: 'unsupported', error: error && error.message ? error.message : String(error) };
+    }
+    throw new Error('cannot fsync directory: ' + directory + ' (' + (error && error.message ? error.message : String(error)) + ')');
+  } finally {
+    if (dirFd !== null) {
+      try {
+        fs.closeSync(dirFd);
+      } catch (error) {
+        throw new Error('cannot close directory descriptor: ' + directory + ' (' + (error && error.message ? error.message : String(error)) + ')');
+      }
+    }
+  }
+  return { status: 'synced', error: null };
+}
+
+// Report (never hide) when directory fsync is unsupported on this platform.
+function reportDirSync(result, context) {
+  if (result && result.status === 'synced') return;
+  const reason = result && result.error ? result.error : 'unknown reason';
+  const message = `${context}: directory fsync unsupported on this platform (${reason}); publication succeeded but durability is not guaranteed across sudden power loss on filesystems that require explicit fsync.`;
+  if (typeof process !== 'undefined' && process.stderr && typeof process.stderr.write === 'function') {
+    process.stderr.write(`Warning: ${message}\n`);
+  }
+}
+
+// Known platform-specific errors where directory fsync is unsupported.
+// On Windows, the kernel rejects directory fsync with EPERM; directory fsync is
+// not supported by the platform. On POSIX platforms, EPERM is a real failure
+// and is propagated.
+function isKnownUnsupportedSyncError(error) {
+  const code = error && error.code ? String(error.code) : '';
+  if (process.platform === 'win32') {
+    return code === 'ENOTSUP' || code === 'ENOSYS' || code === 'EINVAL' || code === 'EISDIR' || code === 'EROFS' || code === 'EPERM';
+  }
+  return code === 'ENOTSUP' || code === 'ENOSYS' || code === 'EINVAL' || code === 'EISDIR' || code === 'EROFS';
 }
 
 function persistPendingEntry(recordFile, entry) {
@@ -258,8 +299,15 @@ function persistPendingEntry(recordFile, entry) {
     fs.fsyncSync(fd);
   } catch (error) {
     try { fs.closeSync(fd); } catch { /* best-effort */ }
-    try { fs.unlinkSync(tmp); } catch { /* best-effort */ }
+    try { fs.unlinkSync(tmp); } catch { /* best-effort cleanup */ }
     throw new Error('cannot write journal for ' + journalPath + ': ' + error.message);
+  }
+  try {
+    // Lifetime rule: exactly one close for this open, after complete write and fsync.
+    fs.closeSync(fd);
+  } catch (error) {
+    try { fs.unlinkSync(tmp); } catch { /* best-effort cleanup */ }
+    throw new Error('cannot close temporary journal file ' + tmp + ': ' + error.message);
   }
   try {
     fs.chmodSync(tmp, FILE_MODE);
@@ -296,8 +344,42 @@ function persistPendingEntry(recordFile, entry) {
   } finally {
     try { fs.unlinkSync(tmp); } catch { /* best-effort cleanup of temp */ }
   }
-  fsyncDirectory(directory);
+  const syncResult = fsyncDirectory(directory);
+  reportDirSync(syncResult, 'journal published');
   return journalPath;
+}
+
+// Validate and canonicalize a definite-failure receipt before storing it as
+// terminal evidence. Never stores raw caller-provided evidence unverified.
+function normalizeDefiniteFailureReceipt(receipt, expectedTxHash) {
+  if (!receipt || typeof receipt !== 'object') {
+    throw new Error('terminal failure requires a valid receipt object');
+  }
+  if (typeof receipt.transactionHash !== 'string') {
+    throw new Error('receipt transaction hash is missing');
+  }
+  if (String(receipt.transactionHash).toLowerCase() !== String(expectedTxHash).toLowerCase()) {
+    throw new Error('receipt transaction hash does not match the journal hash');
+  }
+  const status = receipt.status;
+  const definiteFailure = status === 0 || status === '0' || status === false || status === 0n;
+  if (!definiteFailure) {
+    throw new Error('receipt status is not a definite failure value');
+  }
+  if (!Number.isSafeInteger(receipt.blockNumber) || receipt.blockNumber < 0) {
+    throw new Error('receipt has an invalid block number');
+  }
+  return {
+    chainId: receipt.chainId,
+    blockHash: typeof receipt.blockHash === 'string' ? receipt.blockHash : undefined,
+    blockNumber: receipt.blockNumber,
+    transactionHash: String(expectedTxHash).toLowerCase(),
+    status: 0,
+    gasUsed: typeof receipt.gasUsed === 'bigint' ? receipt.gasUsed.toString()
+      : typeof receipt.gasUsed === 'string' ? receipt.gasUsed
+      : typeof receipt.gasUsed === 'number' && Number.isFinite(receipt.gasUsed) ? String(receipt.gasUsed)
+      : undefined,
+  };
 }
 
 function persistTerminalFailure(recordFile, failureEvidence) {
@@ -311,15 +393,16 @@ function persistTerminalFailure(recordFile, failureEvidence) {
   if (existing.status !== 'ok' || !existing.entry) {
     throw new Error('cannot persist terminal failure: journal is missing or unreadable');
   }
+  const normalizedReceipt = normalizeDefiniteFailureReceipt(
+    failureEvidence && failureEvidence.receipt ? failureEvidence.receipt : null,
+    existing.entry.txHash
+  );
   const entry = {
     ...existing.entry,
     status: 'failed',
     failedAt: new Date().toISOString(),
-    failure: failureEvidence || {},
-    receipt: {
-      transactionHash: existing.entry.txHash,
-      ...(failureEvidence && failureEvidence.receipt ? failureEvidence.receipt : {}),
-    },
+    failure: failureEvidence && failureEvidence.failure ? failureEvidence.failure : {},
+    receipt: normalizedReceipt,
   };
   const tmp = `${journalPath}.fail-${process.pid}-${Date.now()}`;
   const fd = fs.openSync(tmp, 'wx', FILE_MODE);
@@ -350,7 +433,8 @@ function persistTerminalFailure(recordFile, failureEvidence) {
     try { fs.unlinkSync(tmp); } catch { /* best-effort */ }
     throw new Error('cannot publish terminal failure journal: ' + error.message);
   }
-  fsyncDirectory(directory);
+  const syncResult = fsyncDirectory(directory);
+  reportDirSync(syncResult, 'terminal failure journal published');
   return journalPath;
 }
 
@@ -384,7 +468,8 @@ function clearPendingJournal(recordFile, expectedOpId, expectedTxHash) {
     throw new Error(`failed to remove journal at ${journalPath}: ${error.message}`);
   }
   // Best-effort directory fsync to make the deletion durable.
-  fsyncDirectory(path.dirname(journalPath));
+  const syncResult = fsyncDirectory(path.dirname(journalPath));
+  reportDirSync(syncResult, 'journal deleted');
 }
 
 function validateDeploymentTransaction(signed, journal, expectedDeployer, expectedInitcode, expectedNonce) {
@@ -459,6 +544,7 @@ module.exports = {
   readPendingJournal,
   clearPendingJournal,
   persistTerminalFailure,
+  fsyncDirectory,
   validateDeploymentTransaction,
   validateBindingTransaction,
 };

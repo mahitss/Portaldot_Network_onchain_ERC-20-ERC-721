@@ -43,7 +43,7 @@ const { acquireLock, releaseLock } = require('./lib/file-lock.cjs');
 const { checkJournalGate } = require('./lib/journal-gate.cjs');
 const { classifyRecoveryState, MINED_SUCCESS, MINED_FAILURE, KNOWN_PENDING, UNKNOWN, AMBIGUOUS } = require('./lib/recovery-classifier.cjs');
 const { parseAndValidateSignedTx, persistPendingEntry, readPendingJournal, clearPendingJournal, validateDeploymentTransaction, validateBindingTransaction } = require('./lib/transaction-journal.cjs');
-const { verifyAllDeployments } = require('./lib/deployment-verifier.cjs');
+const { verifyAllDeployments, verifyArtifactRuntimeCode } = require('./lib/deployment-verifier.cjs');
 const { loadSharedMapping } = require('./lib/shared-loader.cjs');
 
 const root = path.resolve(__dirname, '..');
@@ -400,7 +400,7 @@ function recordedBindingCount(record) {
 
 // Reconciles a PENDING deployment entry from chain evidence. Throws on any
 // ambiguous outcome; never invents an address.
-async function reconcilePendingEntry(name, entry, probes) {
+async function reconcilePendingEntry(name, entry, probes, artifactPath) {
   const receipt = await probes.receipt(entry.txHash);
   if (receipt === null || receipt === undefined) {
     throw new Error(
@@ -434,6 +434,9 @@ async function reconcilePendingEntry(name, entry, probes) {
       `cannot reconcile ${name}: the receipt reports success but no bytecode exists at ${receipt.contractAddress}; the outcome is ambiguous, refusing to reuse or redeploy`
     );
   }
+  if (artifactPath) {
+    verifyArtifactRuntimeCode(name, artifactPath, code);
+  }
   return {
     address: receipt.contractAddress,
     txHash: entry.txHash,
@@ -448,7 +451,7 @@ async function reconcilePendingEntry(name, entry, probes) {
 // chain: the receipt must exist, be successful, have a matching transaction
 // hash, and (for contract creation) its contract address must match the
 // recorded address. The record and the chain must agree, or the run aborts.
-async function verifyConfirmedEntry(name, entry, probes) {
+async function verifyConfirmedEntry(name, entry, probes, artifactPath) {
   const receipt = await probes.receipt(entry.txHash);
   if (receipt === null || receipt === undefined) {
     throw new Error(
@@ -489,6 +492,9 @@ async function verifyConfirmedEntry(name, entry, probes) {
     throw new Error(
       `the record says ${name} is deployed at ${entry.address} but the chain has no bytecode there; the record and the chain disagree. The record is never silently overwritten - once the disagreement is resolved deliberately, replace the record only through the documented fresh-release operation (POT_FORCE_FRESH_RELEASE=1, which archives the existing file).`
     );
+  }
+  if (artifactPath) {
+    verifyArtifactRuntimeCode(name, artifactPath, code);
   }
 }
 
@@ -891,7 +897,7 @@ async function runRelease({
         const existingReceipt = await probes.receipt(entry.txHash);
         const knownTx = await probes.transaction(entry.txHash);
         const rpcError = null; // would be set if query threw
-        const state = classifyRecoveryState(existingReceipt, knownTx, rpcError);
+        const state = classifyRecoveryState(existingReceipt, knownTx, rpcError, entry.txHash);
         if (state === MINED_FAILURE) {
           const { persistTerminalFailure } = require('./lib/transaction-journal.cjs');
           persistTerminalFailure(recordFile, {
@@ -927,6 +933,11 @@ async function runRelease({
               `cannot reconcile ${name}: the receipt reports success but no bytecode exists at ${existingReceipt.contractAddress}; the outcome is ambiguous, refusing to reuse or redeploy`
             );
           }
+          const artifactPath = (config.artifacts || []).find((a) => a.name === name)?.file;
+          if (!artifactPath) {
+            throw new Error(`cannot verify runtime bytecode for ${name}: no artifact available; refusing to reuse or redeploy`);
+          }
+          verifyArtifactRuntimeCode(name, artifactPath, code);
           record.contracts[name] = {
             address: existingReceipt.contractAddress,
             txHash: entry.txHash,
@@ -993,6 +1004,11 @@ async function runRelease({
             `cannot reuse ${name}: the receipt reports success but no bytecode exists at ${receipt.contractAddress}; the outcome is ambiguous, refusing to reuse or redeploy`
           );
         }
+        const artifactPath = (config.artifacts || []).find((a) => a.name === name)?.file;
+        if (!artifactPath) {
+          throw new Error(`cannot verify runtime bytecode for ${name}: no artifact available; refusing to reuse or redeploy`);
+        }
+        verifyArtifactRuntimeCode(name, artifactPath, code);
         record.contracts[name] = {
           address: receipt.contractAddress,
           txHash: entry.txHash,
@@ -1021,12 +1037,14 @@ async function runRelease({
         const opId = journal.entry.operationId;
         clearPendingJournal(recordFile, opId, entry.txHash);
       } else {
-        record.contracts[name] = await reconcilePendingEntry(name, entry, probes);
+        const artifactPath = (config.artifacts || []).find((a) => a.name === name)?.file;
+        record.contracts[name] = await reconcilePendingEntry(name, entry, probes, artifactPath);
         reuseNotes.push(`${name}: reconciled from chain receipt ${entry.txHash} (no new transaction)`);
         stderr.write(`\n${name}: reconciled from chain receipt ${entry.txHash}\n`);
       }
     } else {
-      await verifyConfirmedEntry(name, entry, probes);
+      const artifactPath = (config.artifacts || []).find((a) => a.name === name)?.file;
+      await verifyConfirmedEntry(name, entry, probes, artifactPath);
       reuseNotes.push(`${name}: confirmed record entry reused (bytecode verified at ${entry.address})`);
     }
   }

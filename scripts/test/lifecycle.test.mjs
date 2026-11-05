@@ -20,6 +20,14 @@ import { createHash } from 'node:crypto';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+const ARTIFACT_FILES = {
+  PotERC20: path.join(root, 'artifacts', 'contracts', 'PotERC20.sol', 'PotERC20.json'),
+  PotERC721: path.join(root, 'artifacts', 'contracts', 'PotERC721.sol', 'PotERC721.json'),
+  PotRegistry: path.join(root, 'artifacts', 'contracts', 'PotRegistry.sol', 'PotRegistry.json'),
+};
+const DEPLOYED_CODE = Object.fromEntries(
+  Object.entries(ARTIFACT_FILES).map(([name, file]) => [name, JSON.parse(fs.readFileSync(file, 'utf8')).deployedBytecode])
+);
 const deployModule = await import(pathToFileURL(path.join(root, 'scripts', 'deploy.js')).href);
 const bindModule = await import(pathToFileURL(path.join(root, 'scripts', 'bind.js')).href);
 const { runRelease } = deployModule;
@@ -86,9 +94,9 @@ function makeProbes(opts = {}) {
     [`0x${'cc'.repeat(32)}`]: { status: 1, blockNumber: 3, transactionHash: `0x${'cc'.repeat(32)}`, contractAddress: REGISTRY_ADDR },
   };
   const defaultCodes = {
-    [TOKEN_ERC20]: `0x${'ff'.repeat(200)}`,
-    [TOKEN_ERC721]: `0x${'ff'.repeat(200)}`,
-    [REGISTRY_ADDR]: `0x${'ff'.repeat(200)}`,
+    [TOKEN_ERC20]: DEPLOYED_CODE.PotERC20,
+    [TOKEN_ERC721]: DEPLOYED_CODE.PotERC721,
+    [REGISTRY_ADDR]: DEPLOYED_CODE.PotRegistry,
   };
 
   const mergedReceipts = { ...defaultReceipts, ...receipts };
@@ -128,11 +136,11 @@ function record(calls, name, fn) {
   };
 }
 
-function artifacts(overrides = {}) {
+function artifacts() {
   return [
-    { name: 'PotERC20', file: path.join(os.tmpdir(), 'a-er.c.json'), args: ['Portaldot Pot Token', 'POT', DEPLOYER], ...overrides },
-    { name: 'PotERC721', file: path.join(os.tmpdir(), 'a-721.json'), args: ['Portaldot Pot Collectibles', 'POTC', DEPLOYER], ...overrides },
-    { name: 'PotRegistry', file: path.join(os.tmpdir(), 'a-reg.json'), args: [], ...overrides },
+    { name: 'PotERC20', file: ARTIFACT_FILES.PotERC20, args: ['Portaldot Pot Token', 'POT', DEPLOYER] },
+    { name: 'PotERC721', file: ARTIFACT_FILES.PotERC721, args: ['Portaldot Pot Collectibles', 'POTC', DEPLOYER] },
+    { name: 'PotRegistry', file: ARTIFACT_FILES.PotRegistry, args: [] },
   ];
 }
 
@@ -333,9 +341,9 @@ test('rerun with a complete record: zero deployments, nothing broadcast', async 
     evmBalance: 10_000n * 10n ** 18n,
     nativeFree: 10_000n * 10n ** 14n,
     codes: {
-      [TOKEN_ERC20]: `0x${'ff'.repeat(200)}`,
-      [TOKEN_ERC721]: `0x${'ff'.repeat(200)}`,
-      [REGISTRY_ADDR]: `0x${'ff'.repeat(200)}`,
+      [TOKEN_ERC20]: DEPLOYED_CODE.PotERC20,
+      [TOKEN_ERC721]: DEPLOYED_CODE.PotERC721,
+      [REGISTRY_ADDR]: DEPLOYED_CODE.PotRegistry,
     },
     receipts: {
       [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
@@ -376,7 +384,7 @@ test('partial deployment resumes without duplicate deployment transactions', asy
   const probes = makeProbes({
     evmBalance: 10_000n * 10n ** 18n,
     nativeFree: 10_000n * 10n ** 14n,
-    codes: { [TOKEN_ERC20]: `0x${'ff'.repeat(200)}` },
+    codes: { [TOKEN_ERC20]: DEPLOYED_CODE.PotERC20 },
     receipts: {
       [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
     },
@@ -420,7 +428,7 @@ test('crash-after-send: a PENDING entry is reconciled from its receipt, never re
   const probes = makeProbes({
     evmBalance: 10_000n * 10n ** 18n,
     nativeFree: 10_000n * 10n ** 14n,
-    codes: { [TOKEN_ERC20]: `0x${'ff'.repeat(200)}` },
+    codes: { [TOKEN_ERC20]: DEPLOYED_CODE.PotERC20 },
     receipts: { [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 9, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 } },
   });
   let sent = 0;
@@ -574,7 +582,11 @@ function bindProbes(opts = {}) {
     gasPrice: record(calls, 'gasPrice', async () => 27_440n),
     blockGasLimit: record(calls, 'blockGasLimit', async () => 18446744073709551615n),
     estimateCall: record(calls, 'estimateCall', async () => 1_000_000_000_000_000n),
-    code: record(calls, 'code', async (address) => codes[address] ?? `0x${'ff'.repeat(300)}`),
+    code: record(calls, 'code', async (address) => codes[address] ?? {
+      [TOKEN_ERC20]: DEPLOYED_CODE.PotERC20,
+      [TOKEN_ERC721]: DEPLOYED_CODE.PotERC721,
+      [REGISTRY_ADDR]: DEPLOYED_CODE.PotRegistry,
+    }[address] ?? '0x'),
     receipt: record(calls, 'receipt', async (txHash) => pendingReceipts[txHash] ?? null),
     deploymentReceipt: record(calls, 'deploymentReceipt', async (txHash) => defaultReceipts[txHash] ?? null),
     nativeFreeBalance: record(calls, 'nativeFreeBalance', async () => nativeFree),
@@ -791,7 +803,7 @@ test('Objective A: completed release cannot have names/symbols changed by differ
     evmBalance: 10_000n * 10n ** 18n,
     nativeFree: 10_000n * 10n ** 14n,
     codes: {
-      [TOKEN_ERC20]: `0x${'ff'.repeat(200)}`,
+      [TOKEN_ERC20]: DEPLOYED_CODE.PotERC20,
     },
     receipts: {
       [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
@@ -825,7 +837,7 @@ test('Objective A: partial release cannot resume with conflicting constructor se
     evmBalance: 10_000n * 10n ** 18n,
     nativeFree: 10_000n * 10n ** 14n,
     codes: {
-      [TOKEN_ERC20]: `0x${'ff'.repeat(200)}`,
+      [TOKEN_ERC20]: DEPLOYED_CODE.PotERC20,
     },
     receipts: {
       [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
@@ -859,9 +871,9 @@ test('Objective A: normal retry with unchanged settings reuses existing deployme
     evmBalance: 10_000n * 10n ** 18n,
     nativeFree: 10_000n * 10n ** 14n,
     codes: {
-      [TOKEN_ERC20]: `0x${'ff'.repeat(200)}`,
-      [TOKEN_ERC721]: `0x${'ff'.repeat(200)}`,
-      [REGISTRY_ADDR]: `0x${'ff'.repeat(200)}`,
+      [TOKEN_ERC20]: DEPLOYED_CODE.PotERC20,
+      [TOKEN_ERC721]: DEPLOYED_CODE.PotERC721,
+      [REGISTRY_ADDR]: DEPLOYED_CODE.PotRegistry,
     },
     receipts: {
       [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
@@ -954,7 +966,7 @@ test('Objective C: confirmed entry with no receipt on chain aborts before reuse'
   const probes = makeProbes({
     evmBalance: 10_000n * 10n ** 18n,
     nativeFree: 10_000n * 10n ** 14n,
-    codes: { [TOKEN_ERC20]: `0x${'ff'.repeat(200)}` },
+    codes: { [TOKEN_ERC20]: DEPLOYED_CODE.PotERC20 },
     receipts: { [`0x${'aa'.repeat(32)}`]: null },
     // No receipts → ambiguous
   });
@@ -992,7 +1004,7 @@ test('Objective C: confirmed entry with mismatched contract address aborts befor
   const probes = makeProbes({
     evmBalance: 10_000n * 10n ** 18n,
     nativeFree: 10_000n * 10n ** 14n,
-    codes: { [TOKEN_ERC20]: `0x${'ff'.repeat(200)}` },
+    codes: { [TOKEN_ERC20]: DEPLOYED_CODE.PotERC20 },
     receipts: {
       [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
     },
@@ -1030,7 +1042,7 @@ test('Objective C: confirmed entry with failed receipt status aborts before reus
   const probes = makeProbes({
     evmBalance: 10_000n * 10n ** 18n,
     nativeFree: 10_000n * 10n ** 14n,
-    codes: { [TOKEN_ERC20]: `0x${'ff'.repeat(200)}` },
+    codes: { [TOKEN_ERC20]: DEPLOYED_CODE.PotERC20 },
     receipts: {
       [`0x${'aa'.repeat(32)}`]: { status: 0, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
     },
@@ -1107,7 +1119,7 @@ test('Objective C: confirmed entry with inconsistent block number aborts before 
   const probes = makeProbes({
     evmBalance: 10_000n * 10n ** 18n,
     nativeFree: 10_000n * 10n ** 14n,
-    codes: { [TOKEN_ERC20]: `0x${'ff'.repeat(200)}` },
+    codes: { [TOKEN_ERC20]: DEPLOYED_CODE.PotERC20 },
     receipts: {
       [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
     },
@@ -1146,9 +1158,9 @@ test('Objective C: verified confirmed entries are reused without duplicate deplo
     evmBalance: 10_000n * 10n ** 18n,
     nativeFree: 10_000n * 10n ** 14n,
     codes: {
-      [TOKEN_ERC20]: `0x${'ff'.repeat(200)}`,
-      [TOKEN_ERC721]: `0x${'ff'.repeat(200)}`,
-      [REGISTRY_ADDR]: `0x${'ff'.repeat(200)}`,
+      [TOKEN_ERC20]: DEPLOYED_CODE.PotERC20,
+      [TOKEN_ERC721]: DEPLOYED_CODE.PotERC721,
+      [REGISTRY_ADDR]: DEPLOYED_CODE.PotRegistry,
     },
     receipts: {
       [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
@@ -1306,9 +1318,9 @@ test('Objective B: crash before broadcast - journaled pending entry rebroadcast 
     evmBalance: 10_000n * 10n ** 18n,
     nativeFree: 10_000n * 10n ** 14n,
     codes: {
-      [TOKEN_ERC20]: `0x${'ff'.repeat(200)}`,
-      [TOKEN_ERC721]: `0x${'ff'.repeat(200)}`,
-      [REGISTRY_ADDR]: `0x${'ff'.repeat(200)}`,
+      [TOKEN_ERC20]: DEPLOYED_CODE.PotERC20,
+      [TOKEN_ERC721]: DEPLOYED_CODE.PotERC721,
+      [REGISTRY_ADDR]: DEPLOYED_CODE.PotRegistry,
     },
     receipts: {
       [txHash]: { status: 1, blockNumber: 42, transactionHash: txHash, contractAddress: TOKEN_ERC20 },
@@ -1409,9 +1421,9 @@ test('deployment recovery uses artifact-based reconstructInitcodes (no DI overri
     evmBalance: 10_000n * 10n ** 18n,
     nativeFree: 10_000n * 10n ** 14n,
     codes: {
-      [TOKEN_ERC20]: `0x${'ff'.repeat(200)}`,
-      [TOKEN_ERC721]: `0x${'ff'.repeat(200)}`,
-      [REGISTRY_ADDR]: `0x${'ff'.repeat(200)}`,
+      [TOKEN_ERC20]: DEPLOYED_CODE.PotERC20,
+      [TOKEN_ERC721]: DEPLOYED_CODE.PotERC721,
+      [REGISTRY_ADDR]: DEPLOYED_CODE.PotRegistry,
     },
     receipts: {},               // PotERC20 absent on this probe
     txs: {},
@@ -1805,9 +1817,9 @@ test('Objective B: broadcast succeeds but receipt wait fails - retry uses same t
     evmBalance: 10_000n * 10n ** 18n,
     nativeFree: 10_000n * 10n ** 14n,
     codes: {
-      [TOKEN_ERC20]: `0x${'ff'.repeat(200)}`,
-      [TOKEN_ERC721]: `0x${'ff'.repeat(200)}`,
-      [REGISTRY_ADDR]: `0x${'ff'.repeat(200)}`,
+      [TOKEN_ERC20]: DEPLOYED_CODE.PotERC20,
+      [TOKEN_ERC721]: DEPLOYED_CODE.PotERC721,
+      [REGISTRY_ADDR]: DEPLOYED_CODE.PotRegistry,
     },
     receipts: {
       [txHash]: { status: 1, blockNumber: 43, transactionHash: txHash, contractAddress: TOKEN_ERC20 },
@@ -1968,9 +1980,9 @@ test('Objective B: receipt success followed by persistence failure aborts withou
     evmBalance: 10_000n * 10n ** 18n,
     nativeFree: 10_000n * 10n ** 14n,
     codes: {
-      [TOKEN_ERC20]: `0x${'ff'.repeat(200)}`,
-      [TOKEN_ERC721]: `0x${'ff'.repeat(200)}`,
-      [REGISTRY_ADDR]: `0x${'ff'.repeat(200)}`,
+      [TOKEN_ERC20]: DEPLOYED_CODE.PotERC20,
+      [TOKEN_ERC721]: DEPLOYED_CODE.PotERC721,
+      [REGISTRY_ADDR]: DEPLOYED_CODE.PotRegistry,
     },
     receipts: {
       [txHash]: { status: 1, blockNumber: 44, transactionHash: txHash, contractAddress: TOKEN_ERC20 },
@@ -2004,9 +2016,9 @@ test('Objective A: fresh release persists complete plan before first broadcast',
     evmBalance: 10_000n * 10n ** 18n,
     nativeFree: 10_000n * 10n ** 14n,
     codes: {
-      [TOKEN_ERC20]: `0x${'ff'.repeat(200)}`,
-      [TOKEN_ERC721]: `0x${'ff'.repeat(200)}`,
-      [REGISTRY_ADDR]: `0x${'ff'.repeat(200)}`,
+      [TOKEN_ERC20]: DEPLOYED_CODE.PotERC20,
+      [TOKEN_ERC721]: DEPLOYED_CODE.PotERC721,
+      [REGISTRY_ADDR]: DEPLOYED_CODE.PotRegistry,
     },
     receipts: {
       [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
@@ -2106,7 +2118,7 @@ function planMismatchHarness(planOverrides = {}, envOverrides = {}, expectErrorP
       evmBalance: 10_000n * 10n ** 18n,
       nativeFree: 10_000n * 10n ** 14n,
       codes: {
-        [TOKEN_ERC20]: `0x${'ff'.repeat(200)}`,
+        [TOKEN_ERC20]: DEPLOYED_CODE.PotERC20,
       },
       receipts: {
         [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
@@ -2182,7 +2194,7 @@ test('Objective B: different release-plan deployer aborts before signing', async
     evmBalance: 10_000n * 10n ** 18n,
     nativeFree: 10_000n * 10n ** 14n,
     codes: {
-      [TOKEN_ERC20]: `0x${'ff'.repeat(200)}`,
+      [TOKEN_ERC20]: DEPLOYED_CODE.PotERC20,
     },
     receipts: {
       [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
@@ -2218,7 +2230,7 @@ test('Objective B: network mismatch aborts before signing', async () => {
     evmBalance: 10_000n * 10n ** 18n,
     nativeFree: 10_000n * 10n ** 14n,
     codes: {
-      [TOKEN_ERC20]: `0x${'ff'.repeat(200)}`,
+      [TOKEN_ERC20]: DEPLOYED_CODE.PotERC20,
     },
     receipts: {
       [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
@@ -2254,7 +2266,7 @@ test('Objective B: chainId mismatch aborts before signing', async () => {
     evmBalance: 10_000n * 10n ** 18n,
     nativeFree: 10_000n * 10n ** 14n,
     codes: {
-      [TOKEN_ERC20]: `0x${'ff'.repeat(200)}`,
+      [TOKEN_ERC20]: DEPLOYED_CODE.PotERC20,
     },
     receipts: {
       [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
@@ -2295,9 +2307,9 @@ test('Objective B: binding attempt with conflicting config aborts before signing
     evmBalance: 10_000n * 10n ** 18n,
     nativeFree: 10_000n * 10n ** 14n,
     codes: {
-      [TOKEN_ERC20]: `0x${'ff'.repeat(200)}`,
-      [TOKEN_ERC721]: `0x${'ff'.repeat(200)}`,
-      [REGISTRY_ADDR]: `0x${'ff'.repeat(200)}`,
+      [TOKEN_ERC20]: DEPLOYED_CODE.PotERC20,
+      [TOKEN_ERC721]: DEPLOYED_CODE.PotERC721,
+      [REGISTRY_ADDR]: DEPLOYED_CODE.PotRegistry,
     },
     receipts: {
       [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
@@ -2354,7 +2366,7 @@ test('Objective C: receipt missing contractAddress aborts even when record has a
   const probes = makeProbes({
     evmBalance: 10_000n * 10n ** 18n,
     nativeFree: 10_000n * 10n ** 14n,
-    codes: { [TOKEN_ERC20]: `0x${'ff'.repeat(200)}` },
+    codes: { [TOKEN_ERC20]: DEPLOYED_CODE.PotERC20 },
     receipts: {
       // Receipt has no contractAddress field
       [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}` },
@@ -2392,7 +2404,7 @@ test('Objective C: receipt contractAddress malformed aborts', async () => {
   const probes = makeProbes({
     evmBalance: 10_000n * 10n ** 18n,
     nativeFree: 10_000n * 10n ** 14n,
-    codes: { [TOKEN_ERC20]: `0x${'ff'.repeat(200)}` },
+    codes: { [TOKEN_ERC20]: DEPLOYED_CODE.PotERC20 },
     receipts: {
       [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: 'not-an-address' },
     },
@@ -2429,7 +2441,7 @@ test('Objective C: receipt address different from recorded address aborts', asyn
   const probes = makeProbes({
     evmBalance: 10_000n * 10n ** 18n,
     nativeFree: 10_000n * 10n ** 14n,
-    codes: { [TOKEN_ERC20]: `0x${'ff'.repeat(200)}` },
+    codes: { [TOKEN_ERC20]: DEPLOYED_CODE.PotERC20 },
     receipts: {
       [`0x${'aa'.repeat(32)}`]: { status: 1, blockNumber: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC721 },
     },
@@ -2466,7 +2478,7 @@ test('Objective C: missing block number aborts reconciliation', async () => {
   const probes = makeProbes({
     evmBalance: 10_000n * 10n ** 18n,
     nativeFree: 10_000n * 10n ** 14n,
-    codes: { [TOKEN_ERC20]: `0x${'ff'.repeat(200)}` },
+    codes: { [TOKEN_ERC20]: DEPLOYED_CODE.PotERC20 },
     receipts: {
       [`0x${'aa'.repeat(32)}`]: { status: 1, transactionHash: `0x${'aa'.repeat(32)}`, contractAddress: TOKEN_ERC20 },
     },

@@ -22,6 +22,14 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+
+// Project-root artifact locations used by the default artifact-aware verifier.
+// Tests may inject an explicit map/list via the `artifacts` parameter.
+const DEFAULT_ARTIFACTS = {
+  PotERC20: path.join(__dirname, '..', 'artifacts', 'contracts', 'PotERC20.sol', 'PotERC20.json'),
+  PotERC721: path.join(__dirname, '..', 'artifacts', 'contracts', 'PotERC721.sol', 'PotERC721.json'),
+  PotRegistry: path.join(__dirname, '..', 'artifacts', 'contracts', 'PotRegistry.sol', 'PotRegistry.json'),
+};
 const { Transaction, Interface } = require('ethers');
 const {
   KIND_ERC20,
@@ -289,6 +297,7 @@ async function runBinding({
   stdout = process.stdout,
   stderr = process.stderr,
   rebroadcastTx,
+  artifacts,
 }) {
   if (!env) throw new Error('environment variables are required');
   for (const [name, value] of Object.entries({ recordIo, probes, recordFile, networkName, chainId, signerAddress, registryViews, bindSender, encodeBind })) {
@@ -388,10 +397,23 @@ async function runBinding({
   }
 
   // Before signing any binding transaction, verify that all three required
-  // contracts have confirmed deployments whose transaction evidence
-  // reconciles with the chain. Do not trust bytecode presence alone as
+  // contracts have confirmed deployments whose transaction evidence reconciles
+  // with the chain. Do not trust bytecode presence alone as
   // proof of deployment identity — the receipt is the source of truth.
-  await verifyAllDeployments(record, probes);
+  // Runtime bytecode is verified against the compiled artifacts.
+  const verifierArtifacts = {};
+  const source = artifacts === undefined
+    ? DEFAULT_ARTIFACTS
+    : (Array.isArray(artifacts)
+      ? Object.fromEntries(artifacts.filter(a => a && a.name && a.file).map(a => [a.name, a.file]))
+      : artifacts);
+  if (!source || typeof source !== 'object') {
+    throw new Error('runBinding: artifacts must be an object mapping contract names to artifact paths, or an array of {name, file}');
+  }
+  for (const name of ['PotERC20', 'PotERC721', 'PotRegistry']) {
+    verifierArtifacts[name] = source[name];
+  }
+  await verifyAllDeployments(record, probes, verifierArtifacts);
 
   const config = await buildPreflightConfig({
     env,
@@ -519,7 +541,7 @@ async function runBinding({
         // Receipt-first: check if already mined.
         const existingReceipt = await probes.receipt(entry.txHash);
         const knownTx = await probes.transaction(entry.txHash);
-        const state = classifyRecoveryState(existingReceipt, knownTx, null);
+        const state = classifyRecoveryState(existingReceipt, knownTx, null, entry.txHash);
         if (state === MINED_FAILURE) {
           const { persistTerminalFailure } = require('./lib/transaction-journal.cjs');
           persistTerminalFailure(recordFile, {

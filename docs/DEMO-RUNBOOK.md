@@ -12,7 +12,8 @@ npm run check:funding
 ```
 
 `npm run check` compiles, regenerates the SDK ABI, and runs all three test suites (72 contract
-tests, 13 SDK tests, 182 release-safety tests including 53 offline lifecycle/recovery tests).
+tests, 13 SDK tests, 200 release-safety tests including 53 offline lifecycle/recovery tests
+and 8 artifact-aware bytecode verification tests).
 `npm run check:funding` must report `funded: true` before anything else.
 
 ## 1. Deploy and bind (one command)
@@ -67,6 +68,27 @@ journal transaction cryptographically matches that independently reconstructed i
 After an interrupted release, do not delete the journal or the deployment record; inspect
 them and rerun. Manual intervention is required for failed or consistently ambiguous
 transactions.
+
+### Platform differences and durability guarantees
+
+Journal publication uses atomic no-clobber semantics (temp file → fsync → link/rename → fsync of the parent directory) on both POSIX and Windows.
+
+- Directory fsync: POSIX platforms fsync the parent directory to make publication durable across sudden power loss. Windows does not support fsync on directory handles (the kernel returns EPERM); the journal reports this as "unsupported" rather than silently swallowing it. Publication itself remains atomic via link/rename, so the durability guarantee that remains is atomic publication — cross-crash consistency of *which* journal exists — but not fsync-level durability of the directory entry on Windows.
+- File permissions: journals are created owner-only (0o600). On Windows this maps to the default restrictive ACL for the temp file.
+- A journal is never overwritten: a second `persistPendingEntry` for an existing journal fails closed with an error. An existing terminal-failure journal blocks any new release until it is resolved manually.
+
+### Manual terminal-failure resolution
+
+A terminal-failure journal (`status: "failed"` with a validated receipt: matching transaction hash, definite failure status `0`, valid non-negative block number) blocks all further operations for that operation. It is durable evidence that the transaction was mined and failed; it is never automatically cleared or rebroadcast.
+
+To resolve a terminal failure:
+1. Inspect `deployments/<network>.json.journal` and the persisted deployment record.
+2. Determine the on-chain cause (out of gas, reverted, nonce gap, etc.) using a block explorer or RPC — read-only only.
+3. Remediate off-chain (e.g., correct the deployment input, replenish funding, reset the nonce gap).
+4. Either rerun the release (which fails closed while the terminal journal remains, protecting against duplicates) or clear the journal only after deliberately replacing the record via `POT_FORCE_FRESH_RELEASE=1`, which archives (never deletes) the previous record.
+5. Never delete a terminal-failure journal manually; a record is considered durably persisted only when the required persistence operation succeeded.
+
+A record is never treated as durably persisted when a persistence operation (write, fsync, publication, or deletion) failed — every such failure propagates and leaves the prior durable evidence intact.
 
 Before running, you must set the native binding IDs:
 
