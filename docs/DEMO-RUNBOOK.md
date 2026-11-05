@@ -12,8 +12,8 @@ npm run check:funding
 ```
 
 `npm run check` compiles, regenerates the SDK ABI, and runs all three test suites (72 contract
-tests, 13 SDK tests, 200 release-safety tests including 53 offline lifecycle/recovery tests
-and 8 artifact-aware bytecode verification tests).
+tests, 13 SDK tests, 209 release-safety tests including 53 offline lifecycle/recovery tests,
+16 failure-injection tests, and 17 artifact-aware bytecode verification tests).
 `npm run check:funding` must report `funded: true` before anything else.
 
 ## 1. Deploy and bind (one command)
@@ -89,6 +89,49 @@ To resolve a terminal failure:
 5. Never delete a terminal-failure journal manually; a record is considered durably persisted only when the required persistence operation succeeded.
 
 A record is never treated as durably persisted when a persistence operation (write, fsync, publication, or deletion) failed — every such failure propagates and leaves the prior durable evidence intact.
+
+### Failure-injection testing
+
+Sixteen dedicated failure-injection tests (`scripts/test/failure-injection.test.mjs`) exercise
+injectable filesystem dependencies to prove that no failure is silently swallowed:
+
+- Journal file close failure → propagates, publication aborted, no journal published
+- Journal file fsync failure → propagates, temp cleaned up, no journal published
+- Temporary cleanup failure after write failure → errors are aggregated, neither hidden
+- Terminal journal close failure → propagates, original pending journal preserved
+- Terminal publication failure → propagates, original pending journal preserved
+- Existing journal preserved after every failed terminal conversion (write, fsync, close, publish)
+- Record write failure → propagates, temp cleaned up
+- Record fsync failure → propagates, temp cleaned up
+- Record rename failure → propagates, temp cleaned up
+- Directory fsync unsupported → reported explicitly, not swallowed (Windows EPERM)
+- Directory fsync permission failure → propagates on POSIX, reported as unsupported on Windows
+- POSIX EROFS → propagated as a real failure, never classified as unsupported
+- Journal deletion failure → propagates, journal preserved
+- Directory descriptor close failure → propagates
+- Temp cleanup failure after successful publish → reported, publication stands
+
+All tests use injected filesystem mocks (no global monkey-patching).
+
+### Artifact verification guarantees
+
+Runtime bytecode verification compares deployed contract code against the compiled Solidity
+artifact (`scripts/lib/deployment-verifier.cjs`):
+
+- **Exact match**: When an artifact has no immutables and no library link references (as all
+  three contracts in this codebase do), runtime bytecode must exactly match `deployedBytecode`.
+  Any mismatch fails closed — the deployment is not reused or redeployed.
+- **Patch-region skipping**: If a future artifact reports immutables or link references, only
+  the non-patched regions are compared. Patch offsets are validated for bounds, length, and
+  non-overlap. Malformed metadata (out-of-range offsets, negative values, zero length,
+  non-integer fields, overlapping ranges) fails closed — no bytecode region is ever silently
+  ignored.
+- **Missing bytecode**: An artifact without valid `deployedBytecode` or `bytecode` fails closed.
+
+This codebase's artifacts produce empty `linkReferences` and no `immutables` metadata, so exact
+match is enforced. Immutable/link-reference verification is implemented but not exercised by
+the current artifact set; it fails closed with a manual-inspection requirement if the metadata
+is present but offsets are unavailable.
 
 Before running, you must set the native binding IDs:
 

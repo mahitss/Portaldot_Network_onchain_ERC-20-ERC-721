@@ -77,63 +77,129 @@ function verifyArtifactRuntimeCode(name, artifactPath, code) {
 
   // Immutables and/or link references are present. We can still verify:
   // compare only the non-patched regions (length match + every non-patched
-  // byte equal). If the artifact does not carry the patch offsets we fail
-  // closed rather than silently accept.
+  // byte equal). If the artifact does not carry usable patch offsets we fail
+  // closed rather than silently accept. When both are present, their skip
+  // ranges are merged and validated together.
+  const bytecodeLength = (expected.length - 2) / 2;
+  const allOffsets = [];
   if (hasImmutables) {
-    const offsets = getImmutableOffsets(artifact.immutables);
-    if (offsets.length === 0) {
+    const offsets = getImmutableOffsets(artifact.immutables, bytecodeLength);
+    allOffsets.push(...offsets);
+  }
+  if (hasLinkRefs) {
+    const offsets = getLinkReferenceOffsets(linkReferences, bytecodeLength);
+    allOffsets.push(...offsets);
+  }
+  if (allOffsets.length === 0) {
+    if (hasImmutables) {
       throw new Error(
         `${name}: artifact reports immutables but no patch offsets are available; automatic verification is not possible; manual inspection is required`
       );
     }
-    return verifyWithSkipRanges(name, expected, actual, offsets, 'immutables');
+    throw new Error(
+      `${name}: artifact reports library link references but no patch offsets are available; automatic verification is not possible; manual inspection is required`
+    );
   }
-  if (hasLinkRefs) {
-    const offsets = getLinkReferenceOffsets(linkReferences);
-    if (offsets.length === 0) {
-      throw new Error(
-        `${name}: artifact reports library link references but no patch offsets are available; automatic verification is not possible; manual inspection is required`
-      );
-    }
-    return verifyWithSkipRanges(name, expected, actual, offsets, 'link-references');
-  }
+  // Build a descriptive method label based on which patch types are present.
+  const labelParts = [];
+  if (hasImmutables) labelParts.push('immutables');
+  if (hasLinkRefs) labelParts.push('link-references');
+  return verifyWithSkipRanges(
+    name,
+    expected,
+    actual,
+    allOffsets,
+    labelParts.join('+')
+  );
   throw new Error(
     `${name}: unsupported bytecode layout; automatic verification is not possible; manual inspection is required`
   );
 }
 
-// Extract absolute byte offsets of immutable patches from solc metadata.
-function getImmutableOffsets(immutables) {
+// Validate and extract immutable patch ranges from an artifact's immutables
+// metadata. solc emits immutables as an array of { offset, length, ... }.
+// Each range is validated: offset and length must be safe integers, offset
+// >= 0, length > 0, and offset + length must not exceed the bytecode length.
+// Malformed metadata causes a fail-closed throw — no bytecode region is
+// silently ignored.
+function getImmutableOffsets(immutables, bytecodeLength) {
   const ranges = [];
-  if (Array.isArray(immutables)) {
-    for (const entry of immutables) {
-      if (entry && Number.isSafeInteger(entry.start) && entry.start >= 0 &&
-          (Number.isSafeInteger(entry.length) ? entry.length : 32) >= 0) {
-        ranges.push({ start: entry.start, length: Number.isSafeInteger(entry.length) ? entry.length : 32 });
-      }
+  if (!Array.isArray(immutables)) return ranges;
+  for (const entry of immutables) {
+    if (!entry || typeof entry !== 'object') continue;
+    const offset = entry.offset !== undefined ? entry.offset : entry.start;
+    const length = entry.length !== undefined ? entry.length : 32;
+    if (
+      typeof offset !== 'number' || !Number.isSafeInteger(offset) || offset < 0 ||
+      typeof length !== 'number' || !Number.isSafeInteger(length) || length <= 0 ||
+      offset + length > bytecodeLength
+    ) {
+      throw new Error(
+        'artifact immutables metadata has a malformed or out-of-range patch ' +
+        '(offset=' + String(offset) + ', length=' + String(length) +
+        ', bytecodeLength=' + bytecodeLength + '); refusing to verify'
+      );
     }
+    ranges.push({ start: offset, length });
   }
   return ranges;
 }
 
-// Extract absolute byte offsets from a solc linkReferences object:
-//   { "contracts/PotRegistry.sol:PotRegistry": { "Library": [ { start: 123, length: 20 } ] } }
-function getLinkReferenceOffsets(linkReferences) {
+// Extract and validate library link-reference patch ranges from a
+// linkReferences/deployedLinkReferences object:
+//   { "contracts/Foo.sol:Foo": { "Lib": [ { start: 123, length: 20 } ] } }
+// solc uses "start" and "length" for link references. Each range is validated
+// the same way as immutable patches. Malformed metadata fails closed.
+function getLinkReferenceOffsets(linkReferences, bytecodeLength) {
   const ranges = [];
   for (const source of Object.values(linkReferences || {})) {
     for (const lib of Object.values(source || {})) {
       for (const entry of lib || []) {
-        if (entry && Number.isSafeInteger(entry.start) && Number.isSafeInteger(entry.length)) {
-          ranges.push({ start: entry.start, length: entry.length });
+        if (!entry || typeof entry !== 'object') continue;
+        const start = entry.start;
+        const length = entry.length;
+        if (
+          typeof start !== 'number' || !Number.isSafeInteger(start) || start < 0 ||
+          typeof length !== 'number' || !Number.isSafeInteger(length) || length <= 0 ||
+          start + length > bytecodeLength
+        ) {
+          throw new Error(
+            'artifact link reference metadata has a malformed or out-of-range patch ' +
+            '(start=' + String(start) + ', length=' + String(length) +
+            ', bytecodeLength=' + bytecodeLength + '); refusing to verify'
+          );
         }
+        ranges.push({ start, length });
       }
     }
   }
   return ranges;
 }
 
+// Validate that skip ranges do not overlap and are within bounds. Overlapping
+// or out-of-range metadata is malformed and fails closed.
+function validateSkipRanges(skipRanges, bytecodeLength, label) {
+  const sorted = [...skipRanges].sort((a, b) => a.start - b.start);
+  for (let i = 0; i < sorted.length; i++) {
+    const r = sorted[i];
+    if (r.start < 0 || r.start >= bytecodeLength || r.length <= 0 || r.start + r.length > bytecodeLength) {
+      throw new Error(
+        label + ' patch range out of bounds (start=' + r.start + ', length=' + r.length +
+        ', bytecodeLength=' + bytecodeLength + '); refusing to verify'
+      );
+    }
+    if (i > 0 && r.start < sorted[i - 1].start + sorted[i - 1].length) {
+      throw new Error(
+        label + ' patch ranges overlap; refusing to verify because a bytecode ' +
+        'region could be silently ignored'
+      );
+    }
+  }
+}
+
 // Compare expected (artifact) vs actual (on-chain) byte arrays, skipping the
-// recorded patch ranges. Throws on any unverifiable difference.
+// recorded patch ranges. Throws on any unverifiable difference. Malformed
+// patch metadata never causes a bytecode region to be silently skipped.
 function verifyWithSkipRanges(name, expected, actual, skipRanges, label) {
   // Normalize to hex byte arrays.
   if (expected.length !== actual.length) {
@@ -141,16 +207,21 @@ function verifyWithSkipRanges(name, expected, actual, skipRanges, label) {
       `${name}: runtime bytecode length does not match the compiled artifact (expected ${(expected.length - 2) / 2} bytes, got ${(actual.length - 2) / 2}); refusing to reuse or redeploy`
     );
   }
+  const bytecodeLength = (expected.length - 2) / 2;
   const expectedBytes = Buffer.from(expected.slice(2), 'hex');
   const actualBytes = Buffer.from(actual.slice(2), 'hex');
+
+  // Validate patch ranges before using them: malformed metadata fails closed.
+  validateSkipRanges(skipRanges, bytecodeLength, label);
+
   // Build skip set.
-  const skip = new Array(expectedBytes.length).fill(false);
+  const skip = new Array(bytecodeLength).fill(false);
   for (const range of skipRanges) {
-    for (let i = range.start; i < range.start + range.length && i < skip.length; i++) {
+    for (let i = range.start; i < range.start + range.length; i++) {
       skip[i] = true;
     }
   }
-  for (let i = 0; i < expectedBytes.length; i++) {
+  for (let i = 0; i < bytecodeLength; i++) {
     if (skip[i]) continue;
     if (expectedBytes[i] !== actualBytes[i]) {
       throw new Error(
@@ -158,7 +229,7 @@ function verifyWithSkipRanges(name, expected, actual, skipRanges, label) {
       );
     }
   }
-  return { method: 'patched-' + label, artifact: path.basename(''), bytes: expectedBytes.length, patchedRanges: skipRanges.length };
+  return { method: 'patched-' + label, artifact: path.basename(''), bytes: bytecodeLength, patchedRanges: skipRanges.length };
 }
 
 // Verify a single confirmed deployment entry against chain evidence.

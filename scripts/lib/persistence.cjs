@@ -1,9 +1,21 @@
 // Atomic file persistence for deployment records and related JSON state.
 // Every write is replace-atomic (temporary file in the same directory, then
 // rename), so an interrupted run can never leave a half-written record.
+//
+// Directory synchronization uses the shared durability module
+// (./durability.cjs). Directory fsync results are reported, never silently
+// swallowed:
+//   - 'synced'     — directory fsync completed; the rename is durable
+//   - 'unsupported' — platform/filesystem does not support directory fsync
+//                      (e.g. Windows); the atomic rename still provides
+//                      cross-crash visibility, but fsync-level durability
+//                      is best-effort
+//   - thrown error — real I/O or permission failure (POSIX EPERM, EROFS,
+//                    ENOSPC, EIO); the operation is NOT durably persisted
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { fsyncDirectory, reportDirSync } = require('./durability.cjs');
 
 function readJsonRecord(file) {
   if (!fs.existsSync(file)) {
@@ -18,56 +30,64 @@ function readJsonRecord(file) {
 
 let writeCounter = 0;
 
-function writeJsonAtomic(file, value) {
+function writeJsonAtomic(file, value, fs_ = fs) {
   const directory = path.dirname(file);
-  fs.mkdirSync(directory, { recursive: true });
+  fs_.mkdirSync(directory, { recursive: true });
   const tmp = `${file}.tmp-${process.pid}-${Date.now()}-${writeCounter++}`;
   // Write the temporary file and fsync it before the atomic rename so an
   // interrupted run never leaves a half-written replacement visible.
-  const fd = fs.openSync(tmp, 'w', 0o600);
+  const fd = fs_.openSync(tmp, 'w', 0o600);
   try {
     const data = `${JSON.stringify(value, null, 2)}\n`;
     let written = 0;
     while (written < data.length) {
-      const n = fs.writeSync(fd, data, written);
+      const n = fs_.writeSync(fd, data, written);
       if (n <= 0) throw new Error('failed to write full record payload');
       written += n;
     }
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
-  }
-  try {
-    fs.renameSync(tmp, file);
+    fs_.fsyncSync(fd);
   } catch (error) {
-    try {
-      fs.unlinkSync(tmp);
-    } catch {
-      // the tmp file is best-effort removed; the original record is intact
-    }
-    throw new Error(`atomic record write failed for ${file}: ${error.message}`);
+    let closeError = null;
+    try { fs_.closeSync(fd); } catch (e) { closeError = e; }
+    let unlinkError = null;
+    try { fs_.unlinkSync(tmp); } catch (e) { unlinkError = e; }
+    let message = 'atomic record write failed for ' + file + ': ' + error.message;
+    if (closeError !== null) message += '. close also failed: ' + closeError.message;
+    if (unlinkError !== null) message += '. cleanup also failed: ' + unlinkError.message;
+    throw new Error(message);
   }
-  // Best-effort directory fsync so the rename is durable where supported.
-  // Not all filesystems/platforms support directory fsync; failure here is
-  // not fatal but the file is valid once the rename completes.
   try {
-    const dirFd = fs.openSync(directory, 'r');
-    fs.fsyncSync(dirFd);
-    fs.closeSync(dirFd);
-  } catch {
-    // directory fsync unsupported; rename still provides atomic visibility
+    fs_.closeSync(fd);
+  } catch (error) {
+    try { fs_.unlinkSync(tmp); } catch { /* cleanup aggregated below */ }
+    throw new Error(
+      'cannot close temporary record file ' + tmp + ': ' + error.message +
+      '; publication aborted to avoid incomplete record'
+    );
   }
+  try {
+    fs_.renameSync(tmp, file);
+  } catch (error) {
+    try { fs_.unlinkSync(tmp); } catch { /* cleanup failure aggregated below */ }
+    throw new Error('atomic record write failed for ' + file + ': ' + error.message);
+  }
+  // Directory fsync makes the rename durable. Report the result; never
+  // swallow a real filesystem error.
+  const syncResult = fsyncDirectory(directory, fs_);
+  reportDirSync(syncResult, 'record written');
+  // Return the sync status so callers can distinguish durable vs best-effort.
+  return { status: syncResult.status, error: syncResult.error, file };
 }
 
 // Archive an existing record next to itself before a deliberate fresh
 // release. Never deletes anything; returns the archive path or null.
-function archiveRecord(file) {
-  if (!fs.existsSync(file)) {
+function archiveRecord(file, fs_ = fs) {
+  if (!fs_.existsSync(file)) {
     return null;
   }
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const archive = `${file}.pre-${stamp}`;
-  fs.copyFileSync(file, archive);
+  fs_.copyFileSync(file, archive);
   return archive;
 }
 

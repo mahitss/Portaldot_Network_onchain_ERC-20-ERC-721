@@ -2,6 +2,11 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { Transaction } = require('ethers');
+const {
+  isKnownUnsupportedSyncError,
+  fsyncDirectory,
+  reportDirSync,
+} = require('./durability.cjs');
 
 const JOURNAL_SCHEMA_VERSION = 1;
 const FILE_MODE = 0o600;
@@ -228,89 +233,56 @@ function readPendingJournal(recordFile) {
   }
 }
 
-function fsyncDirectory(directory) {
-  let dirFd = null;
-  try {
-    dirFd = fs.openSync(directory, 'r');
-  } catch (error) {
-    if (isKnownUnsupportedSyncError(error)) {
-      return { status: 'unsupported', error: error && error.message ? error.message : String(error) };
-    }
-    throw new Error('cannot open directory for synchronization: ' + directory + ' (' + (error && error.message ? error.message : String(error)) + ')');
-  }
-  try {
-    fs.fsyncSync(dirFd);
-  } catch (error) {
-    if (isKnownUnsupportedSyncError(error)) {
-      return { status: 'unsupported', error: error && error.message ? error.message : String(error) };
-    }
-    throw new Error('cannot fsync directory: ' + directory + ' (' + (error && error.message ? error.message : String(error)) + ')');
-  } finally {
-    if (dirFd !== null) {
-      try {
-        fs.closeSync(dirFd);
-      } catch (error) {
-        throw new Error('cannot close directory descriptor: ' + directory + ' (' + (error && error.message ? error.message : String(error)) + ')');
-      }
-    }
-  }
-  return { status: 'synced', error: null };
-}
+// Directory synchronization is provided by the shared durability module
+// (./durability.cjs). It is used by persistPendingEntry,
+// persistTerminalFailure, and clearPendingJournal.
 
-// Report (never hide) when directory fsync is unsupported on this platform.
-function reportDirSync(result, context) {
-  if (result && result.status === 'synced') return;
-  const reason = result && result.error ? result.error : 'unknown reason';
-  const message = `${context}: directory fsync unsupported on this platform (${reason}); publication succeeded but durability is not guaranteed across sudden power loss on filesystems that require explicit fsync.`;
-  if (typeof process !== 'undefined' && process.stderr && typeof process.stderr.write === 'function') {
-    process.stderr.write(`Warning: ${message}\n`);
-  }
-}
-
-// Known platform-specific errors where directory fsync is unsupported.
-// On Windows, the kernel rejects directory fsync with EPERM; directory fsync is
-// not supported by the platform. On POSIX platforms, EPERM is a real failure
-// and is propagated.
-function isKnownUnsupportedSyncError(error) {
-  const code = error && error.code ? String(error.code) : '';
-  if (process.platform === 'win32') {
-    return code === 'ENOTSUP' || code === 'ENOSYS' || code === 'EINVAL' || code === 'EISDIR' || code === 'EROFS' || code === 'EPERM';
-  }
-  return code === 'ENOTSUP' || code === 'ENOSYS' || code === 'EINVAL' || code === 'EISDIR' || code === 'EROFS';
-}
-
-function persistPendingEntry(recordFile, entry) {
+function persistPendingEntry(recordFile, entry, fs_ = fs) {
   const directory = path.dirname(recordFile);
-  fs.mkdirSync(directory, { recursive: true });
+  fs_.mkdirSync(directory, { recursive: true });
   const journalPath = recordFile + '.journal';
 
   // Unique temporary file in the same directory.
   const tmp = `${journalPath}.tmp-${process.pid}-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
   // Exclusive creation: the temporary file is created fresh.
-  const fd = fs.openSync(tmp, 'wx', FILE_MODE);
+  const fd = fs_.openSync(tmp, 'wx', FILE_MODE);
   try {
     const data = `${JSON.stringify(entry, null, 2)}\n`;
     let written = 0;
     while (written < data.length) {
-      const n = fs.writeSync(fd, data, written);
+      const n = fs_.writeSync(fd, data, written);
       if (n <= 0) throw new Error('failed to write full journal payload');
       written += n;
     }
-    fs.fsyncSync(fd);
+    fs_.fsyncSync(fd);
   } catch (error) {
-    try { fs.closeSync(fd); } catch { /* best-effort */ }
-    try { fs.unlinkSync(tmp); } catch { /* best-effort cleanup */ }
-    throw new Error('cannot write journal for ' + journalPath + ': ' + error.message);
+    // Write or fsync failed: close fd and clean up temp, aggregating errors
+    // so cleanup failures do not hide the original error.
+    let closeError = null;
+    try { fs_.closeSync(fd); } catch (e) { closeError = e; }
+    let unlinkError = null;
+    try { fs_.unlinkSync(tmp); } catch (e) { unlinkError = e; }
+    let message = 'cannot write journal for ' + journalPath + ': ' + error.message;
+    if (closeError !== null) message += '. close also failed: ' + closeError.message;
+    if (unlinkError !== null) message += '. cleanup also failed: ' + unlinkError.message;
+    throw new Error(message);
+  }
+  // Lifetime rule: exactly one close for this open, after complete write and
+  // fsync. Close failures propagate; publication is aborted so an incomplete
+  // journal is never published.
+  try {
+    fs_.closeSync(fd);
+  } catch (error) {
+    let unlinkError = null;
+    try { fs_.unlinkSync(tmp); } catch { /* cleanup failure aggregated below */ }
+    let message =
+      'cannot close temporary journal file ' + tmp + ': ' + error.message +
+      '; publication aborted to avoid incomplete journal';
+    if (unlinkError !== null) message += '. cleanup also failed: ' + unlinkError.message;
+    throw new Error(message);
   }
   try {
-    // Lifetime rule: exactly one close for this open, after complete write and fsync.
-    fs.closeSync(fd);
-  } catch (error) {
-    try { fs.unlinkSync(tmp); } catch { /* best-effort cleanup */ }
-    throw new Error('cannot close temporary journal file ' + tmp + ': ' + error.message);
-  }
-  try {
-    fs.chmodSync(tmp, FILE_MODE);
+    fs_.chmodSync(tmp, FILE_MODE);
   } catch {
     // best-effort; default perms remain restrictive on POSIX
   }
@@ -319,9 +291,10 @@ function persistPendingEntry(recordFile, entry) {
   // publication. If publication fails, the temp file is removed and the
   // original (missing or existing) journal is left untouched.
   try {
-    fs.linkSync(tmp, journalPath);
+    fs_.linkSync(tmp, journalPath);
   } catch (error) {
-    try { fs.unlinkSync(tmp); } catch { /* best-effort */ }
+    let unlinkError = null;
+    try { fs_.unlinkSync(tmp); } catch { /* cleanup failure aggregated below */ }
     if (error.code === 'EEXIST') {
       const existing = readPendingJournal(recordFile);
       if (existing.status === 'ok' && existing.entry &&
@@ -331,6 +304,7 @@ function persistPendingEntry(recordFile, entry) {
         const existingStr = JSON.stringify(existing.entry);
         const newStr = JSON.stringify(entry);
         if (existingStr === newStr) {
+          try { fs_.unlinkSync(tmp); } catch { /* duplicate already published; cleanup best-effort */ }
           return journalPath;
         }
         throw new Error('cannot persist journal: same operation ID but different payload.');
@@ -340,11 +314,20 @@ function persistPendingEntry(recordFile, entry) {
       }
       throw new Error('cannot persist journal: an unresolved journal already exists at ' + journalPath + '.');
     }
-    throw new Error('cannot publish journal at ' + journalPath + ': ' + error.message);
-  } finally {
-    try { fs.unlinkSync(tmp); } catch { /* best-effort cleanup of temp */ }
+    let message = 'cannot publish journal at ' + journalPath + ': ' + error.message;
+    if (unlinkError !== null) message += '. cleanup also failed: ' + unlinkError.message;
+    throw new Error(message);
   }
-  const syncResult = fsyncDirectory(directory);
+  // The hard link was created: unlink the temporary name. A cleanup failure
+  // here does not undo publication, but it must not silently disappear.
+  try {
+    fs_.unlinkSync(tmp);
+  } catch (error) {
+    throw new Error(
+      'journal published at ' + journalPath + ' but temporary file cleanup failed: ' + error.message
+    );
+  }
+  const syncResult = fsyncDirectory(directory, fs_);
   reportDirSync(syncResult, 'journal published');
   return journalPath;
 }
@@ -382,9 +365,9 @@ function normalizeDefiniteFailureReceipt(receipt, expectedTxHash) {
   };
 }
 
-function persistTerminalFailure(recordFile, failureEvidence) {
+function persistTerminalFailure(recordFile, failureEvidence, fs_ = fs) {
   const directory = path.dirname(recordFile);
-  fs.mkdirSync(directory, { recursive: true });
+  fs_.mkdirSync(directory, { recursive: true });
   const journalPath = recordFile + '.journal';
   const existing = readPendingJournal(recordFile);
   if (existing.status === 'terminal_failure') {
@@ -405,40 +388,76 @@ function persistTerminalFailure(recordFile, failureEvidence) {
     receipt: normalizedReceipt,
   };
   const tmp = `${journalPath}.fail-${process.pid}-${Date.now()}`;
-  const fd = fs.openSync(tmp, 'wx', FILE_MODE);
+  const fd = fs_.openSync(tmp, 'wx', FILE_MODE);
   try {
     const data = `${JSON.stringify(entry, null, 2)}\n`;
     let written = 0;
     while (written < data.length) {
-      const n = fs.writeSync(fd, data, written);
+      const n = fs_.writeSync(fd, data, written);
       if (n <= 0) throw new Error('failed to write full journal payload');
       written += n;
     }
-    fs.fsyncSync(fd);
+    fs_.fsyncSync(fd);
   } catch (error) {
-    try { fs.closeSync(fd); } catch { /* best-effort */ }
-    try { fs.unlinkSync(tmp); } catch { /* best-effort */ }
-    throw new Error('cannot write terminal failure journal: ' + error.message);
+    // Write or fsync failed: close fd and clean up temp, aggregating errors.
+    let closeError = null;
+    try { fs_.closeSync(fd); } catch (e) { closeError = e; }
+    let unlinkError = null;
+    try { fs_.unlinkSync(tmp); } catch (e) { unlinkError = e; }
+    let message = 'cannot write terminal failure journal: ' + error.message;
+    if (closeError !== null) message += '. close also failed: ' + closeError.message;
+    if (unlinkError !== null) message += '. cleanup also failed: ' + unlinkError.message;
+    throw new Error(message);
   }
-  try { fs.closeSync(fd); } catch { /* best-effort */ }
+  // Close must succeed before publication. Never publish terminal evidence
+  // after a failed close. The original pending journal is preserved.
   try {
-    fs.chmodSync(tmp, FILE_MODE);
+    fs_.closeSync(fd);
+  } catch (error) {
+    let unlinkError = null;
+    try { fs_.unlinkSync(tmp); } catch { /* cleanup failure aggregated below */ }
+    let message =
+      'cannot close temporary terminal failure journal ' + tmp + ': ' + error.message +
+      '; publication aborted, original pending journal preserved';
+    if (unlinkError !== null) message += '. cleanup also failed: ' + unlinkError.message;
+    throw new Error(message);
+  }
+  try {
+    fs_.chmodSync(tmp, FILE_MODE);
   } catch {
     // best-effort
   }
   // Same-operation atomic replace (rename over the existing pending journal).
+  // If rename fails, the temp file is removed and the original pending
+  // journal is preserved untouched.
+  let renameError = null;
   try {
-    fs.renameSync(tmp, journalPath);
+    fs_.renameSync(tmp, journalPath);
   } catch (error) {
-    try { fs.unlinkSync(tmp); } catch { /* best-effort */ }
-    throw new Error('cannot publish terminal failure journal: ' + error.message);
+    renameError = error;
   }
-  const syncResult = fsyncDirectory(directory);
+  if (renameError !== null) {
+    let unlinkError = null;
+    try { fs_.unlinkSync(tmp); } catch (e) { unlinkError = e; }
+    let message = 'cannot publish terminal failure journal: ' + renameError.message;
+    if (unlinkError !== null) message += '. cleanup also failed: ' + unlinkError.message;
+    throw new Error(message);
+  }
+  // Verify the terminal journal after publication: read it back and confirm
+  // it is readable as terminal_failure before returning success.
+  const verified = readPendingJournal(recordFile);
+  if (verified.status !== 'terminal_failure') {
+    throw new Error(
+      'terminal failure journal published but read-back verification failed: ' +
+        (verified.error || 'unexpected status ' + verified.status)
+    );
+  }
+  const syncResult = fsyncDirectory(directory, fs_);
   reportDirSync(syncResult, 'terminal failure journal published');
   return journalPath;
 }
 
-function clearPendingJournal(recordFile, expectedOpId, expectedTxHash) {
+function clearPendingJournal(recordFile, expectedOpId, expectedTxHash, fs_ = fs) {
   if (!expectedOpId) {
     throw new Error('clearPendingJournal requires an operation ID');
   }
@@ -446,7 +465,7 @@ function clearPendingJournal(recordFile, expectedOpId, expectedTxHash) {
     throw new Error('clearPendingJournal requires a transaction hash');
   }
   const journalPath = recordFile + '.journal';
-  if (!fs.existsSync(journalPath)) {
+  if (!fs_.existsSync(journalPath)) {
     return;
   }
   const existing = readPendingJournal(recordFile);
@@ -463,12 +482,12 @@ function clearPendingJournal(recordFile, expectedOpId, expectedTxHash) {
     throw new Error('refusing to clear journal: txHash mismatch');
   }
   try {
-    fs.unlinkSync(journalPath);
+    fs_.unlinkSync(journalPath);
   } catch (error) {
     throw new Error(`failed to remove journal at ${journalPath}: ${error.message}`);
   }
   // Best-effort directory fsync to make the deletion durable.
-  const syncResult = fsyncDirectory(path.dirname(journalPath));
+  const syncResult = fsyncDirectory(path.dirname(journalPath), fs_);
   reportDirSync(syncResult, 'journal deleted');
 }
 
