@@ -1285,7 +1285,7 @@ test('Objective B: crash before broadcast - journaled pending entry rebroadcast 
   // First run crashes after journaling PotERC20, before broadcast
   await assert.rejects(() => runRelease({
     env: planEnv,
-    deployerAddress: DEPLOYER,
+    deployerAddress: wallet.address,
     recordIo,
     probes,
     deployContract: deploy1,
@@ -1333,7 +1333,7 @@ test('Objective B: crash before broadcast - journaled pending entry rebroadcast 
 
   const result = await runRelease({
     env: planEnv,
-    deployerAddress: DEPLOYER,
+    deployerAddress: wallet.address,
     recordIo,
     probes: probes2,
     deployContract: deploy2,
@@ -1348,6 +1348,228 @@ test('Objective B: crash before broadcast - journaled pending entry rebroadcast 
   assert.equal(final.contracts.PotERC20.status, 'confirmed');
   assert.equal(final.contracts.PotERC20.txHash, txHash, 'same txHash reused from journal, not redeployed');
   assert.equal(final.contracts.PotERC20.blockNumber, 42);
+});
+
+test('deployment recovery: tampered journal expectedData is rejected before rebroadcast; zero rebroadcast, journal retained', async () => {
+  const recordFile = tempFile();
+  const recordIo = makeRecordIo(null);
+  const { ethers } = await import('ethers');
+  const wallet = ethers.Wallet.createRandom();
+  const mockData = '0x608060405234801561001057600080fd5b50';
+  const signedTx = await wallet.signTransaction({ data: mockData, gasLimit: 100000n, chainId: CHAIN_ID, nonce: 0, maxFeePerGas: 1000n, maxPriorityFeePerGas: 100n });
+  const txHash = ethers.Transaction.from(signedTx).hash;
+  const { persistPendingEntry } = await import('../lib/transaction-journal.cjs');
+  const planEnv = { ...probeEnv(), POT_ERC20_NAME: 'Custom Token', POT_ERC20_SYMBOL: 'CUSTOM', POT_ERC721_NAME: 'Custom Collectibles', POT_ERC721_SYMBOL: 'CUSTC' };
+  // First run: crash after journaling with the correct mocked data
+  const crashingDeploy = async (artifact, gasLimit, hooks) => {
+    hooks.onSent(txHash, signedTx);
+    persistPendingEntry(recordFile, {
+      schemaVersion: 1,
+      operationId: 'test-op-tamper',
+      operation: 'deploy',
+      contract: artifact.name,
+      txHash,
+      signed: signedTx,
+      expectedSender: wallet.address,
+      chainId: CHAIN_ID,
+      nonce: 0,
+      expectedTo: null,
+      expectedValue: '0',
+      expectedData: mockData,
+      params: { artifact: artifact.name, gasLimit: gasLimit.toString(), args: artifact.args },
+      createdAt: new Date().toISOString(),
+      attempts: 1,
+      status: 'pending',
+    });
+    throw new Error('crash after journaling, before broadcast');
+  };
+  let sent = 0;
+  const deploy1 = async (artifact, gasLimit, hooks) => { sent += 1; return crashingDeploy(artifact, gasLimit, hooks); };
+  const probes = makeProbes({ evmBalance: 10_000n * 10n ** 18n, nativeFree: 10_000n * 10n ** 14n });
+  await assert.rejects(() => runRelease({
+    env: planEnv,
+    deployerAddress: wallet.address,
+    recordIo,
+    probes,
+    deployContract: deploy1,
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+  }), /crash after journaling/);
+  assert.equal(sent, 1);
+  // Tamper with the journal on disk: replace expectedData with a foreign value
+  const raw = JSON.parse(fs.readFileSync(recordFile + '.journal', 'utf8'));
+  raw.expectedData = '0xdeadbeef';
+  fs.writeFileSync(recordFile + '.journal', JSON.stringify(raw, null, 2) + '\n');
+  // Second run: tampered journal must abort before any rebroadcast
+  let rebroadcastCount = 0;
+  const rebroadcastTx = async (signed) => {
+    rebroadcastCount += 1;
+    return { receipt: { status: 1, blockNumber: 42, transactionHash: txHash, contractAddress: TOKEN_ERC20 }, address: TOKEN_ERC20 };
+  };
+  await assert.rejects(() => runRelease({
+    env: planEnv,
+    deployerAddress: wallet.address,
+    recordIo,
+    probes,
+    deployContract: async () => { throw new Error('must not be called'); },
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+    rebroadcastTx,
+    expectedInitcodes: { PotERC20: mockData },
+  }), /tampered|does not match/);
+  assert.equal(rebroadcastCount, 0, 'no rebroadcast after tampered journal');
+  assert.equal(fs.existsSync(recordFile + '.journal'), true, 'journal preserved after tampered rejection');
+});
+
+test('binding recovery: tampered journal intent is rejected before rebroadcast; zero bind sends, journal retained', async () => {
+  const { ethers } = await import('ethers');
+  const wallet = ethers.Wallet.createRandom();
+  const { persistPendingEntry } = await import('../lib/transaction-journal.cjs');
+  const bogusCalldata = '0xdeadbeef';
+  const txRequest = { to: REGISTRY_ADDR, data: bogusCalldata, gasLimit: 100000n, chainId: CHAIN_ID, nonce: 0, maxFeePerGas: 1000n, maxPriorityFeePerGas: 100n, value: 0 };
+  const signedTx = await wallet.signTransaction(txRequest);
+  const txHash = ethers.Transaction.from(signedTx).hash;
+  const recordFile = tempFile();
+  const record = JSON.parse(JSON.stringify(existingRecord));
+  record.deployer = wallet.address;
+  record.releasePlan.deployer = wallet.address;
+  record.bindings = [
+    { token: TOKEN_ERC20, tokenKind: 0, nativeKind: 1, nativeId: 1, nativeDecimals: 14, evmDecimals: 18, conversionFactor: '10000', nativeAccountHash: COMMITMENT, active: false, txHash, status: 'pending' },
+  ];
+  const recordIo = makeRecordIo(record);
+  persistPendingEntry(recordFile, {
+    schemaVersion: 1,
+    operationId: 'test-op-bind-tamper',
+    operation: 'bind',
+    contract: 'PotRegistry',
+    txHash,
+    signed: signedTx,
+    expectedSender: wallet.address,
+    chainId: CHAIN_ID,
+    nonce: 0,
+    expectedTo: REGISTRY_ADDR,
+    expectedValue: '0',
+    expectedData: bogusCalldata,
+    createdAt: new Date().toISOString(),
+    attempts: 0,
+    status: 'pending',
+    params: { token: TOKEN_ERC20, tokenKind: 0, nativeKind: 1, nativeId: 1, nativeDecimals: 14, evmDecimals: 18, nativeAccountHash: COMMITMENT },
+  });
+  const probes = bindProbes({});
+  const sentBinds = [];
+  const bindSender = async (params, hooks) => { sentBinds.push(params); return { hash: txHash, wait: async () => ({ status: 1, blockNumber: 77, transactionHash: txHash }) }; };
+  const registryViews = {
+    isBound: () => false,
+    bindingOfToken: () => null,
+    bindingCount: async () => 2,
+  };
+  const encodeBind = () => '0xbind';
+  let rebroadcastCount = 0;
+  const rebroadcastTx = async (signed) => {
+    rebroadcastCount += 1;
+    return { receipt: { status: 1, blockNumber: 77, transactionHash: txHash }, address: REGISTRY_ADDR };
+  };
+  await assert.rejects(() => runBinding({
+    env: probeEnv(),
+    recordIo,
+    probes,
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+    signerAddress: wallet.address,
+    registryViews,
+    bindSender,
+    encodeBind,
+    registryAddress: REGISTRY_ADDR,
+    tokenAddresses: { erc20: TOKEN_ERC20, erc721: TOKEN_ERC721 },
+    rebroadcastTx,
+  }), /does not match/);
+  assert.equal(sentBinds.length, 0, 'no binding transaction sent after tampered rejection');
+  assert.equal(rebroadcastCount, 0, 'no rebroadcast after tampered rejection');
+  assert.equal(fs.existsSync(recordFile + '.journal'), true, 'journal preserved after tampered rejection');
+});
+
+test('binding recovery: journal signed by a different wallet is rejected before broadcast', async () => {
+  const { ethers } = await import('ethers');
+  const walletA = ethers.Wallet.createRandom();
+  const walletB = ethers.Wallet.createRandom();
+  const registryArtifact = JSON.parse(fs.readFileSync(path.join(root, 'artifacts', 'contracts', 'PotRegistry.sol', 'PotRegistry.json'), 'utf8'));
+  const iface = new ethers.Interface(registryArtifact.abi);
+  const nativeAccountHash = COMMITMENT;
+  const calldata = iface.encodeFunctionData('bind', [
+    TOKEN_ERC20,
+    0, // KIND_ERC20
+    1, // NATIVE_ASSETS
+    1, // nativeId
+    14, // nativeDecimals
+    18, // evmDecimals
+    nativeAccountHash,
+  ]);
+  const txRequest = { to: REGISTRY_ADDR, data: calldata, gasLimit: 100000n, chainId: CHAIN_ID, nonce: 0, maxFeePerGas: 1000n, maxPriorityFeePerGas: 100n, value: 0 };
+  // Signed by walletB, but production signer (expectedSigner) is walletA
+  const signedTx = await walletB.signTransaction(txRequest);
+  const txHash = ethers.Transaction.from(signedTx).hash;
+  const { persistPendingEntry } = await import('../lib/transaction-journal.cjs');
+  const recordFile = tempFile();
+  const record = JSON.parse(JSON.stringify(existingRecord));
+  record.deployer = walletA.address;
+  record.releasePlan.deployer = walletA.address;
+  record.bindings = [
+    { token: TOKEN_ERC20, tokenKind: 0, nativeKind: 1, nativeId: 1, nativeDecimals: 14, evmDecimals: 18, conversionFactor: '10000', nativeAccountHash: COMMITMENT, active: false, txHash, status: 'pending' },
+  ];
+  const recordIo = makeRecordIo(record);
+  persistPendingEntry(recordFile, {
+    schemaVersion: 1,
+    operationId: 'test-op-bind-signer',
+    operation: 'bind',
+    contract: 'PotRegistry',
+    txHash,
+    signed: signedTx,
+    expectedSender: walletB.address, // journal claims walletB, but production signer is walletA
+    chainId: CHAIN_ID,
+    nonce: 0,
+    expectedTo: REGISTRY_ADDR,
+    expectedValue: '0',
+    expectedData: calldata,
+    createdAt: new Date().toISOString(),
+    attempts: 0,
+    status: 'pending',
+    params: { token: TOKEN_ERC20, tokenKind: 0, nativeKind: 1, nativeId: 1, nativeDecimals: 14, evmDecimals: 18, nativeAccountHash: COMMITMENT },
+  });
+  const probes = bindProbes({});
+  const sentBinds = [];
+  const bindSender = async (params, hooks) => { sentBinds.push(params); return { hash: txHash, wait: async () => ({ status: 1, blockNumber: 77, transactionHash: txHash }) }; };
+  const registryViews = {
+    isBound: () => false,
+    bindingOfToken: () => null,
+    bindingCount: async () => 2,
+  };
+  const encodeBind = () => '0xbind';
+  let rebroadcastCount = 0;
+  const rebroadcastTx = async (signed) => {
+    rebroadcastCount += 1;
+    return { receipt: { status: 1, blockNumber: 77, transactionHash: txHash }, address: REGISTRY_ADDR };
+  };
+  await assert.rejects(() => runBinding({
+    env: probeEnv(),
+    recordIo,
+    probes,
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+    signerAddress: walletA.address,
+    registryViews,
+    bindSender,
+    encodeBind,
+    registryAddress: REGISTRY_ADDR,
+    tokenAddresses: { erc20: TOKEN_ERC20, erc721: TOKEN_ERC721 },
+    rebroadcastTx,
+  }), /does not match|signer/);
+  assert.equal(sentBinds.length, 0, 'no binding transaction sent after signer mismatch');
+  assert.equal(rebroadcastCount, 0, 'no rebroadcast after signer mismatch');
+  assert.equal(fs.existsSync(recordFile + '.journal'), true, 'journal preserved after signer mismatch rejection');
 });
 
 test('Objective B: crash before journaling - no broadcast attempted', async () => {
@@ -1475,7 +1697,7 @@ test('Objective B: broadcast succeeds but receipt wait fails - retry uses same t
 
   await assert.rejects(() => runRelease({
     env: planEnv,
-    deployerAddress: DEPLOYER,
+    deployerAddress: wallet.address,
     recordIo,
     probes,
     deployContract: deploy1,
@@ -1519,7 +1741,7 @@ test('Objective B: broadcast succeeds but receipt wait fails - retry uses same t
 
   const result = await runRelease({
     env: planEnv,
-    deployerAddress: DEPLOYER,
+    deployerAddress: wallet.address,
     recordIo,
     probes: probes2,
     deployContract: deploy2,

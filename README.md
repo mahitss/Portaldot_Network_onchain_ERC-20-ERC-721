@@ -131,6 +131,34 @@ them, so a rerun never deploys duplicates or overwrites recorded evidence. A mal
 deployment record is never silently overwritten; replacing it requires the explicit
 `POT_FORCE_FRESH_RELEASE=1` operation, which archives the old record first.
 
+### Crash recovery and journal safety
+
+The release keeps a **transaction journal** (`deployments/<network>.json.journal`) next to the
+deployment record. Before a transaction is broadcast, the exact signed bytes are persisted in
+an owner-only (0o600) journal; the deployment JSON only stores non-sensitive metadata
+(transaction hashes, operation, contract/token identity, pending/confirmed status, block
+numbers).
+
+If the process is interrupted before broadcast (or before the record is confirmed), the next
+`deploy:testnet` / `bind:testnet` detects the journal before signing and:
+
+- independently reconstructs the intended operations — deployment initcode from the compiled
+  artifacts and the frozen release plan (creation bytecode + ABI-encoded constructor
+  arguments), and binding calldata from the validated deployment record and registry ABI;
+- validates the journaled signed transaction against that independently reconstructed
+  intent (sender, chain id `420420777`, nonce, destination, value, transaction data and
+  hash); a journal that cannot be matched to the exact intended transaction is rejected
+  before any broadcast, replacement signature, or journal cleanup;
+- reconciles the journal against chain evidence (receipt lookup first): a confirmed receipt
+  is reused, a pending transaction is left untouched, an ambiguous RPC result preserves the
+  journal and aborts, and only a provably unknown transaction is rebroadcast as the exact
+  same signed bytes;
+- revalidates the durable record (and the linked contracts) before any journal is cleared.
+
+After an interrupted run, do not delete the journal or the deployment record. A malformed
+journal, a mismatched record/journal, or an unverifiable chain read fails closed and
+requires explicit operator inspection before anything else is signed.
+
 ## Scripts
 
 | Command | Purpose |

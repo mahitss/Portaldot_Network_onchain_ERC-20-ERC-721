@@ -6,6 +6,36 @@ const { Transaction } = require('ethers');
 const JOURNAL_SCHEMA_VERSION = 1;
 const FILE_MODE = 0o600;
 const PORTALDOT_CHAIN_ID = 420420777;
+const MAX_UINT256 = (1n << 256n) - 1n;
+
+// Strict canonical nonce validation: non-negative integer, no leading zeros
+// (except "0"), no fractions, no signs, no exponents.
+function isCanonicalNonce(value) {
+  if (typeof value === 'bigint') {
+    return value >= 0n && value <= MAX_UINT256;
+  }
+  if (typeof value === 'number') {
+    return Number.isSafeInteger(value) && value >= 0 && value <= Number(MAX_UINT256);
+  }
+  if (typeof value === 'string') {
+    return /^(0|[1-9][0-9]*)$/.test(value) && BigInt(value) <= MAX_UINT256;
+  }
+  return false;
+}
+
+// Canonical string representation of a nonce for comparison without coercion.
+function canonicalNonceString(value) {
+  if (typeof value === 'bigint') {
+    return value.toString(10);
+  }
+  if (typeof value === 'number') {
+    return value.toString(10);
+  }
+  if (typeof value === 'string') {
+    return BigInt(value).toString(10);
+  }
+  throw new Error('cannot canonicalize nonce of type ' + typeof value);
+}
 
 function generateOperationId() {
   return crypto.randomUUID();
@@ -47,20 +77,22 @@ function parseAndValidateSignedTx(signed, expectedChainId, options = {}) {
       throw new Error('signed transaction hash ' + parsed.hash + ' does not match expected ' + options.expectedTxHash);
     }
   }
+  // Strict nonce validation: journal nonce must be canonical.
   if (options.expectedNonce !== undefined && options.expectedNonce !== null) {
-    // Strict nonce comparison without Number() coercion.
-    const parsedNonce = parsed.nonce;
-    const expectedNonce = options.expectedNonce;
-    // Both must be integers.
-    if (typeof parsedNonce !== 'number' && typeof parsedNonce !== 'bigint') {
-      throw new Error('signed transaction nonce is not a valid integer');
+    if (!isCanonicalNonce(options.expectedNonce)) {
+      throw new Error('journal nonce is not a canonical non-negative integer: ' + String(options.expectedNonce));
     }
-    if (typeof expectedNonce !== 'number' && typeof expectedNonce !== 'bigint' && typeof expectedNonce !== 'string') {
-      throw new Error('expected nonce is not a valid integer');
-    }
-    // Compare as strings to avoid coercion.
-    if (String(parsedNonce) !== String(expectedNonce)) {
-      throw new Error('signed transaction nonce ' + parsedNonce + ' does not match expected ' + expectedNonce);
+  }
+  if (parsed.nonce === undefined || parsed.nonce === null) {
+    throw new Error('signed transaction has no nonce');
+  }
+  if (!isCanonicalNonce(parsed.nonce)) {
+    throw new Error('signed transaction nonce is not a canonical non-negative integer: ' + String(parsed.nonce));
+  }
+  if (options.expectedNonce !== undefined && options.expectedNonce !== null) {
+    // Compare canonical string representations to avoid Number() coercion.
+    if (canonicalNonceString(parsed.nonce) !== canonicalNonceString(options.expectedNonce)) {
+      throw new Error('signed transaction nonce ' + parsed.nonce + ' does not match expected ' + options.expectedNonce);
     }
   }
   if (options.expectedTo !== undefined) {
@@ -123,6 +155,9 @@ function readPendingJournal(recordFile) {
     }
     if (parsed.nonce === undefined || parsed.nonce === null) {
       return { status: 'malformed', entry: null, error: 'missing nonce' };
+    }
+    if (!isCanonicalNonce(parsed.nonce)) {
+      return { status: 'malformed', entry: null, error: 'journal nonce is not a canonical non-negative integer' };
     }
     if (parsed.operation !== 'deploy' && parsed.operation !== 'bind') {
       return { status: 'malformed', entry: null, error: 'invalid operation type: ' + parsed.operation };
@@ -237,7 +272,7 @@ function clearPendingJournal(recordFile, expectedOpId, expectedTxHash) {
   }
 }
 
-function validateDeploymentTransaction(signed, journal, expectedDeployer, expectedInitcode) {
+function validateDeploymentTransaction(signed, journal, expectedDeployer, expectedInitcode, expectedNonce) {
   if (!journal || !journal.txHash) {
     throw new Error('validateDeploymentTransaction requires a valid journal with txHash');
   }
@@ -247,9 +282,13 @@ function validateDeploymentTransaction(signed, journal, expectedDeployer, expect
   if (!expectedInitcode) {
     throw new Error('validateDeploymentTransaction requires independently reconstructed initcode');
   }
+  if (expectedNonce === undefined || expectedNonce === null) {
+    throw new Error('validateDeploymentTransaction requires an explicit expected nonce');
+  }
   const parsed = parseAndValidateSignedTx(signed, PORTALDOT_CHAIN_ID, {
     expectedSender: expectedDeployer,
     expectedTxHash: journal.txHash,
+    expectedNonce: expectedNonce,
     expectedTo: null,
     expectedValue: '0',
     expectedData: expectedInitcode,
@@ -263,7 +302,7 @@ function validateDeploymentTransaction(signed, journal, expectedDeployer, expect
   return parsed;
 }
 
-function validateBindingTransaction(signed, journal, expectedSigner, expectedRegistry, expectedCalldata) {
+function validateBindingTransaction(signed, journal, expectedSigner, expectedRegistry, expectedCalldata, expectedNonce) {
   if (!journal || !journal.txHash) {
     throw new Error('validateBindingTransaction requires a valid journal with txHash');
   }
@@ -276,9 +315,13 @@ function validateBindingTransaction(signed, journal, expectedSigner, expectedReg
   if (!expectedCalldata) {
     throw new Error('validateBindingTransaction requires explicit expected calldata');
   }
+  if (expectedNonce === undefined || expectedNonce === null) {
+    throw new Error('validateBindingTransaction requires an explicit expected nonce');
+  }
   const parsed = parseAndValidateSignedTx(signed, PORTALDOT_CHAIN_ID, {
     expectedSender: expectedSigner,
     expectedTxHash: journal.txHash,
+    expectedNonce: expectedNonce,
     expectedTo: expectedRegistry,
     expectedValue: '0',
     expectedData: expectedCalldata,

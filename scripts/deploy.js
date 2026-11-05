@@ -20,7 +20,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { Transaction } = require('ethers');
+const { Transaction, Interface } = require('ethers');
 const {
   CHAIN_ID,
   MAX_CODE_SIZE_BYTES,
@@ -557,9 +557,12 @@ function validatePlanAgainstRecord(plan, record, networkName, chainId, deployerE
         'Refusing to continue; set POT_FORCE_FRESH_RELEASE=1 to start a new release.'
     );
   }
-  if (plan.deployer !== deployerEvm) {
+  // Connected deployer is normalized (lowercased) before comparing against the
+  // plan, which stores EVM addresses in lowercase form.
+  const normalizedDeployer = validateEvmAddress(deployerEvm, 'connected deployer EVM address');
+  if (plan.deployer !== normalizedDeployer) {
     throw new Error(
-      `release plan deployer (${plan.deployer}) does not match connected deployer (${deployerEvm}). ` +
+      `release plan deployer (${plan.deployer}) does not match connected deployer (${normalizedDeployer}). ` +
         'Refusing to continue; set POT_FORCE_FRESH_RELEASE=1 to start a new release.'
     );
   }
@@ -624,6 +627,48 @@ function validatePlanAgainstRecord(plan, record, networkName, chainId, deployerE
   if (plan.commitmentSource !== 'derived' && plan.commitmentSource !== 'override') {
     throw new Error('release plan has invalid commitmentSource');
   }
+}
+
+// Reconstructs the full deployment initcode (creation bytecode + ABI-encoded
+// constructor arguments) from the validated preflight configuration, which is
+// itself derived from the immutable release plan. Never falls back to a
+// journal-supplied expectedData.
+// - Loads each compiled artifact (bytecode + ABI).
+// - ABI-encodes the constructor arguments from the artifact definition.
+// - Returns a map contract name -> expected initcode hex.
+// - Fails closed if any artifact or constructor argument is unavailable.
+function reconstructInitcodes(config) {
+  const result = {};
+  for (const artifactInfo of (config.artifacts || [])) {
+    const name = artifactInfo.name;
+    if (!artifactInfo.file) {
+      throw new Error('cannot reconstruct initcode for ' + name + ': artifact file path is missing');
+    }
+    let artifact;
+    try {
+      artifact = JSON.parse(fs.readFileSync(artifactInfo.file, 'utf8'));
+    } catch (error) {
+      throw new Error('cannot reconstruct initcode for ' + name + ': cannot read artifact at ' + artifactInfo.file + ' (' + error.message + ')');
+    }
+    if (!artifact.bytecode) {
+      throw new Error('cannot reconstruct initcode for ' + name + ': artifact bytecode is missing');
+    }
+    if (!artifact.abi) {
+      throw new Error('cannot reconstruct initcode for ' + name + ': artifact ABI is missing');
+    }
+    if (typeof artifact.bytecode !== 'string' || !/^0x[0-9a-fA-F]+$/.test(artifact.bytecode)) {
+      throw new Error('cannot reconstruct initcode for ' + name + ': artifact bytecode is not valid hex');
+    }
+    const iface = new Interface(artifact.abi);
+    let encodedArgs;
+    try {
+      encodedArgs = iface.encodeDeploy(artifactInfo.args || []);
+    } catch (error) {
+      throw new Error('cannot reconstruct initcode for ' + name + ': constructor arguments cannot be ABI-encoded (' + error.message + ')');
+    }
+    result[name] = artifact.bytecode + encodedArgs.slice(2);
+  }
+  return result;
 }
 
 async function runRelease({
@@ -795,6 +840,15 @@ async function runRelease({
     config.nativeAccountHash = planConfig.nativeAccountHash;
   }
 
+  // Resolve the expected initcodes: an injected override (DI in tests) takes
+  // precedence; otherwise reconstruct from the validated preflight
+  // configuration, which itself derives from the immutable release plan.
+  // Reconstruction can never be skipped silently — if the artifacts cannot be
+  // loaded, the run fails closed before any transaction is considered.
+  const expectedInitcodesMap = (expectedInitcodes && Object.keys(expectedInitcodes).length > 0)
+    ? expectedInitcodes
+    : reconstructInitcodes(config);
+
   // 2. Reconcile: pending entries are completed from the chain (post-crash
   //    recovery); confirmed entries are re-verified against live bytecode.
   //    Both are read-only chain queries; nothing is redeployed and nothing
@@ -811,14 +865,28 @@ async function runRelease({
         // Rebroadcast the exact same signed transaction instead of signing a
         // new one. This preserves the nonce and txHash, eliminating duplicate
         // transaction risk after a crash between journaling and broadcast.
-        // Validate the signed transaction before rebroadcasting.
-        // Use journal's expectedData as the expected initcode.
-        // In production, this was set from the actual deploy transaction data.
-        const expectedInitcode = (journal.status === 'ok' && journal.entry) ? journal.entry.expectedData : null;
+        // Validate the signed transaction before rebroadcasting using
+        // independently reconstructed initcode (never journal-sourced expectedData).
+        const expectedInitcode = expectedInitcodesMap[name] || null;
         if (!expectedInitcode) {
-          throw new Error('cannot reconstruct expected initcode for deployment validation');
+          throw new Error('cannot reconstruct expected initcode for deployment validation of ' + name + ': no artifact initcode available');
         }
-        const parsed = validateDeploymentTransaction(signedTx, journal.entry, journal.entry.expectedSender, expectedInitcode);
+        // Journal's expectedData must match independently reconstructed initcode.
+        // Journal data can never authorize a different transaction.
+        if (
+          journal.status === 'ok' &&
+          journal.entry &&
+          journal.entry.expectedData &&
+          journal.entry.expectedData.toLowerCase() !== expectedInitcode.toLowerCase()
+        ) {
+          throw new Error(
+            'journal expectedData for ' + name + ' does not match independently reconstructed initcode; refusing to rebroadcast tampered journal'
+          );
+        }
+        // Expected deployer is derived from the validated preflight config
+        // (which itself derives from the immutable release plan), never from
+        // the journal.
+        const parsed = validateDeploymentTransaction(signedTx, journal.entry, config.deployerEvm, expectedInitcode, journal.entry.nonce);
         // Receipt-first: check if already mined before rebroadcasting.
         const existingReceipt = await probes.receipt(entry.txHash);
         const knownTx = await probes.transaction(entry.txHash);
@@ -1037,25 +1105,6 @@ async function main() {
   fs.mkdirSync(directory, { recursive: true });
   const recordFile = path.join(directory, `${networkName}.json`);
 
-  // Pre-compute expected initcodes from compiled artifacts for independent
-  // validation during recovery. This ensures the journal's expectedData is
-  // not the sole authority.
-  const expectedInitcodes = {};
-  try {
-    const artifacts = ['PotERC20', 'PotERC721', 'PotRegistry'];
-    for (const name of artifacts) {
-      const artifactFile = path.join(root, 'artifacts', 'contracts', `${name}.sol`, `${name}.json`);
-      if (fs.existsSync(artifactFile)) {
-        const artifact = JSON.parse(fs.readFileSync(artifactFile, 'utf8'));
-        if (artifact.bytecode) {
-          expectedInitcodes[name] = artifact.bytecode;
-        }
-      }
-    }
-  } catch {
-    // best-effort; initcodes may not be available
-  }
-
   // Pre-broadcast journaling executor: each deployment transaction is signed
   // locally, its hash is derived, and the pending journal entry is persisted
   // (via hooks.onSent) BEFORE the exact signed transaction is broadcast.
@@ -1138,7 +1187,6 @@ async function main() {
     chainId: Number((await hre.ethers.provider.getNetwork()).chainId),
     forceFresh: String(process.env.POT_FORCE_FRESH_RELEASE || '') === '1',
     rebroadcastTx,
-    expectedInitcodes,
   });
 }
 
