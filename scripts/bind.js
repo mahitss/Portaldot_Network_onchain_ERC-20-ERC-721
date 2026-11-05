@@ -190,11 +190,76 @@ async function reconcilePendingBinding(entry, probes) {
     );
   }
   validateReceipt(entry.txHash, receipt);
+  if (!Number.isSafeInteger(receipt.blockNumber) || receipt.blockNumber < 0) {
+    throw new Error(
+      `cannot reconcile the pending binding for ${entry.token}: the receipt for ${entry.txHash} has an invalid block number ${String(receipt.blockNumber)}`
+    );
+  }
   return {
     ...entry,
-    blockNumber: Number(receipt.blockNumber),
+    blockNumber: receipt.blockNumber,
     status: 'confirmed',
   };
+}
+
+// Verify that the on-chain binding for `entry.token` exactly matches the
+// independently reconstructed intended binding for this release. Used by
+// both reconciliation paths after a mismatch-free mined receipt is found.
+// Throws (never proceeds) on any discrepancy.
+async function verifyRecoveredBinding(record, entry, intendedCalls, config, registryViews) {
+  const erc20Lower = String(record.tokens.erc20.address).toLowerCase();
+  const erc721Lower = String(record.tokens.erc721.address).toLowerCase();
+  const entryTokenLower = String(entry.token).toLowerCase();
+  if (erc20Lower === erc721Lower) {
+    throw new Error('deployment record erc20 and erc721 token addresses are identical; binding cannot be attributed');
+  }
+  let tokenEntryKey = null;
+  if (entryTokenLower === erc20Lower) {
+    tokenEntryKey = 'erc20';
+  } else if (entryTokenLower === erc721Lower) {
+    tokenEntryKey = 'erc721';
+  } else {
+    throw new Error('pending binding token ' + entry.token + ' does not match any recorded token address');
+  }
+  const intendedCall = intendedCalls.find((c) => c.tokens === tokenEntryKey);
+  if (!intendedCall) {
+    throw new Error('cannot verify binding intent for ' + entry.token + ': no intended call found');
+  }
+  const expected = {
+    token: entry.token,
+    tokenKind: intendedCall.tokenKind,
+    nativeKind: intendedCall.nativeKind,
+    nativeId: intendedCall.nativeId,
+    nativeDecimals: intendedCall.nativeDecimals,
+    evmDecimals: intendedCall.evmDecimals,
+    conversionFactor: (10n ** BigInt(intendedCall.evmDecimals - intendedCall.nativeDecimals)).toString(),
+    nativeAccountHash: config.nativeAccountHash,
+    active: true,
+  };
+  let bound;
+  try {
+    bound = await registryViews.isBound(expected.token);
+  } catch (error) {
+    throw new Error(`reading the on-chain binding state for ${expected.token} failed: ${error.message}`);
+  }
+  if (!bound) {
+    throw new Error(
+      `the registry reports ${expected.token} unbound even though the receipt reported success; refusing to confirm the binding`
+    );
+  }
+  let actual;
+  try {
+    actual = await registryViews.bindingOfToken(expected.token);
+  } catch (error) {
+    throw new Error(`reading the on-chain binding for ${expected.token} failed: ${error.message}`);
+  }
+  const mismatches = compareBinding(expected, actual);
+  if (mismatches.length > 0) {
+    throw new Error(
+      `on-chain binding for ${expected.token} does not match the intended configuration after recovery: ${mismatches.join('; ')}`
+    );
+  }
+  return expected;
 }
 
 // The dependency-injected binding orchestration. All side effects enter
@@ -456,36 +521,74 @@ async function runBinding({
         const knownTx = await probes.transaction(entry.txHash);
         const state = classifyRecoveryState(existingReceipt, knownTx, null);
         if (state === MINED_FAILURE) {
-          stderr.write(`\\nbinding for ${entry.token}: transaction mined but FAILED; preserving journal for manual recovery\\n`);
-          continue;
+          const { persistTerminalFailure } = require('./lib/transaction-journal.cjs');
+          persistTerminalFailure(recordFile, {
+            receipt: {
+              transactionHash: existingReceipt.transactionHash,
+              status: existingReceipt.status,
+              blockNumber: existingReceipt.blockNumber,
+            },
+          });
+          throw new Error(
+            `binding transaction for ${entry.token} was mined but failed (status ${existingReceipt.status ?? 'unknown'}); terminal failure evidence retained in the journal. Manual intervention is required; refusing to proceed.`
+          );
         }
         if (state === MINED_SUCCESS) {
+          validateReceipt(entry.txHash, existingReceipt);
+          if (!Number.isSafeInteger(existingReceipt.blockNumber) || existingReceipt.blockNumber < 0) {
+            throw new Error(
+              `cannot reconcile binding for ${entry.token}: the receipt for ${entry.txHash} has an invalid block number ${String(existingReceipt.blockNumber)}; refusing to confirm the binding`
+            );
+          }
+          await verifyRecoveredBinding(record, entry, intendedCalls, config, registryViews);
           const confirmedEntry = { ...entry, blockNumber: existingReceipt.blockNumber, status: 'confirmed' };
           upsertBinding(record, confirmedEntry);
           record.updatedAt = new Date().toISOString();
           recordIo.write(recordFile, record);
           const verifyLoaded = recordIo.read(recordFile);
-          if (verifyLoaded.status !== 'ok' || !verifyLoaded.data) {
+          if (
+            verifyLoaded.status !== 'ok' ||
+            !verifyLoaded.data ||
+            !Array.isArray(verifyLoaded.data.bindings)
+          ) {
             throw new Error('failed to verify persisted binding record; journal preserved for recovery');
           }
+          const persisted = verifyLoaded.data.bindings.find(
+            (candidate) => candidate && String(candidate.token).toLowerCase() === String(entry.token).toLowerCase()
+          );
+          if (
+            !persisted ||
+            persisted.status !== 'confirmed' ||
+            String(persisted.txHash).toLowerCase() !== String(entry.txHash).toLowerCase()
+          ) {
+            throw new Error('persisted binding record does not match the recovered transaction; journal preserved for recovery');
+          }
           pendingReconciled += 1;
-          stderr.write(`\\nbinding for ${entry.token}: already mined, reconciled without rebroadcast\\n`);
+          stderr.write(`\nbinding for ${entry.token}: already mined, reconciled without rebroadcast\n`);
           const opId = journal.entry.operationId;
           clearPendingJournal(recordFile, opId, entry.txHash);
           continue;
         }
         // Check if transaction is known but pending.
         if (state === KNOWN_PENDING) {
-          stderr.write(`\\nbinding for ${entry.token}: transaction known but pending, preserving state\\n`);
-          continue;
+          throw new Error(
+            `binding transaction for ${entry.token} is known but not yet mined; the original journal is preserved. Refusing to proceed or sign any new transaction until the outcome is known.`
+          );
         }
         if (state === AMBIGUOUS) {
-          stderr.write(`\\nbinding for ${entry.token}: recovery state ambiguous; preserving journal\\n`);
-          continue;
+          throw new Error(
+            `recovery of binding for ${entry.token} is ambiguous; the journal and record are preserved. Refusing to proceed or sign any new transaction until the outcome is known.`
+          );
         }
         const broadcast = await rebroadcastTx(signedTx);
         const receipt = broadcast.receipt;
         validateReceipt(entry.txHash, receipt);
+        if (!Number.isSafeInteger(receipt.blockNumber) || receipt.blockNumber < 0) {
+          throw new Error(
+            `cannot reconcile binding for ${entry.token}: the receipt for ${entry.txHash} has an invalid block number ${String(receipt.blockNumber)}; refusing to confirm the binding`
+          );
+        }
+        await verifyRecoveredBinding(record, entry, intendedCalls, config, registryViews);
         const confirmedEntry = {
           ...entry,
           blockNumber: receipt.blockNumber,
@@ -495,17 +598,51 @@ async function runBinding({
         record.updatedAt = new Date().toISOString();
         recordIo.write(recordFile, record);
         const verifyLoaded = recordIo.read(recordFile);
-        if (verifyLoaded.status !== 'ok' || !verifyLoaded.data) {
+        if (
+          verifyLoaded.status !== 'ok' ||
+          !verifyLoaded.data ||
+          !Array.isArray(verifyLoaded.data.bindings)
+        ) {
           throw new Error('failed to verify persisted binding record; journal preserved for recovery');
+        }
+        const persisted = verifyLoaded.data.bindings.find(
+          (candidate) => candidate && String(candidate.token).toLowerCase() === String(entry.token).toLowerCase()
+        );
+        if (
+          !persisted ||
+          persisted.status !== 'confirmed' ||
+          String(persisted.txHash).toLowerCase() !== String(entry.txHash).toLowerCase()
+        ) {
+          throw new Error('persisted binding record does not match the recovered transaction; journal preserved for recovery');
         }
         pendingReconciled += 1;
         stderr.write(`\nbinding for ${entry.token}: rebroadcast journaled transaction ${entry.txHash} (no new transaction)\n`);
-        const journal = readPendingJournal(recordFile);
-        const opId = (journal.status === 'ok' && journal.entry) ? journal.entry.operationId : null;
+        const opId = journal.entry.operationId;
         clearPendingJournal(recordFile, opId, entry.txHash);
       } else {
         const confirmedEntry = await reconcilePendingBinding(entry, probes);
+        await verifyRecoveredBinding(record, entry, intendedCalls, config, registryViews);
         upsertBinding(record, confirmedEntry);
+        record.updatedAt = new Date().toISOString();
+        recordIo.write(recordFile, record);
+        const verifyLoaded = recordIo.read(recordFile);
+        if (
+          verifyLoaded.status !== 'ok' ||
+          !verifyLoaded.data ||
+          !Array.isArray(verifyLoaded.data.bindings)
+        ) {
+          throw new Error('failed to verify persisted binding record; journal preserved for recovery');
+        }
+        const persisted = verifyLoaded.data.bindings.find(
+          (candidate) => candidate && String(candidate.token).toLowerCase() === String(entry.token).toLowerCase()
+        );
+        if (
+          !persisted ||
+          persisted.status !== 'confirmed' ||
+          String(persisted.txHash).toLowerCase() !== String(entry.txHash).toLowerCase()
+        ) {
+          throw new Error('persisted binding record does not match the recovered transaction; journal preserved for recovery');
+        }
         pendingReconciled += 1;
         stderr.write(`\nbinding for ${entry.token}: reconciled from chain receipt ${entry.txHash} (no new transaction)\n`);
       }

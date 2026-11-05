@@ -183,8 +183,29 @@ function readPendingJournal(recordFile) {
       return { status: 'malformed', entry: null, error: 'missing createdAt' };
     }
     // Validate status.
+    if (parsed.status === 'failed') {
+      // Terminal failure evidence: receipt evidence must be present and match
+      // the journaled transaction hash.
+      if (!parsed.receipt || typeof parsed.receipt !== 'object') {
+        return { status: 'malformed', entry: null, error: 'terminal failure journal is missing receipt evidence' };
+      }
+      if (typeof parsed.receipt.transactionHash !== 'string' ||
+          parsed.receipt.transactionHash.toLowerCase() !== String(parsed.txHash).toLowerCase()) {
+        return { status: 'malformed', entry: null, error: 'terminal failure receipt transaction hash does not match the journal hash' };
+      }
+      if (!Number.isSafeInteger(parsed.receipt.blockNumber) || parsed.receipt.blockNumber < 0) {
+        return { status: 'malformed', entry: null, error: 'terminal failure receipt has an invalid block number' };
+      }
+      if (!Number.isSafeInteger(parsed.receipt.status) || parsed.receipt.status !== 0) {
+        return { status: 'malformed', entry: null, error: 'terminal failure receipt status is not a known failure value' };
+      }
+      if (!parsed.failedAt || typeof parsed.failedAt !== 'string') {
+        return { status: 'malformed', entry: null, error: 'terminal failure journal is missing failedAt' };
+      }
+      return { status: 'terminal_failure', entry: parsed, error: null };
+    }
     if (parsed.status !== 'pending') {
-      return { status: 'malformed', entry: null, error: 'invalid status (expected pending)' };
+      return { status: 'malformed', entry: null, error: 'invalid status: ' + String(parsed.status) };
     }
     // Operation-specific validation.
     if (parsed.operation === 'deploy') {
@@ -203,44 +224,133 @@ function readPendingJournal(recordFile) {
   }
 }
 
+function fsyncDirectory(directory) {
+  try {
+    const dirFd = fs.openSync(directory, 'r');
+    try {
+      fs.fsyncSync(dirFd);
+    } finally {
+      fs.closeSync(dirFd);
+    }
+  } catch {
+    // directory fsync unsupported on this platform; link still provides
+    // atomic publication, durability is best-effort.
+  }
+}
+
 function persistPendingEntry(recordFile, entry) {
   const directory = path.dirname(recordFile);
   fs.mkdirSync(directory, { recursive: true });
   const journalPath = recordFile + '.journal';
 
-  // Exclusive creation using O_EXCL (wx) — no-clobber.
-  let fd;
+  // Unique temporary file in the same directory.
+  const tmp = `${journalPath}.tmp-${process.pid}-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
+  // Exclusive creation: the temporary file is created fresh.
+  const fd = fs.openSync(tmp, 'wx', FILE_MODE);
   try {
-    fd = fs.openSync(journalPath, 'wx', FILE_MODE);
-  } catch (error) {
-    if (error.code !== 'EEXIST') {
-      throw new Error('cannot create journal file ' + journalPath + ': ' + error.message);
+    const data = `${JSON.stringify(entry, null, 2)}\n`;
+    let written = 0;
+    while (written < data.length) {
+      const n = fs.writeSync(fd, data, written);
+      if (n <= 0) throw new Error('failed to write full journal payload');
+      written += n;
     }
-    const existing = readPendingJournal(recordFile);
-    if (existing.status === 'ok' && existing.entry &&
-        existing.entry.txHash === entry.txHash &&
-        existing.entry.operation === entry.operation &&
-        existing.entry.operationId === entry.operationId) {
-      const existingStr = JSON.stringify(existing.entry);
-      const newStr = JSON.stringify(entry);
-      if (existingStr === newStr) {
-        return journalPath;
-      }
-      throw new Error('cannot persist journal: same operation ID but different payload.');
-    }
-    throw new Error('cannot persist journal: an unresolved journal already exists at ' + journalPath + '.');
-  }
-  try {
-    fs.writeSync(fd, JSON.stringify(entry, null, 2) + '\n');
     fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
+  } catch (error) {
+    try { fs.closeSync(fd); } catch { /* best-effort */ }
+    try { fs.unlinkSync(tmp); } catch { /* best-effort */ }
+    throw new Error('cannot write journal for ' + journalPath + ': ' + error.message);
   }
   try {
-    fs.chmodSync(journalPath, FILE_MODE);
+    fs.chmodSync(tmp, FILE_MODE);
+  } catch {
+    // best-effort; default perms remain restrictive on POSIX
+  }
+  // Publish atomically without replacing any existing journal. link(2) fails
+  // with EEXIST if the destination exists, giving atomic no-clobber
+  // publication. If publication fails, the temp file is removed and the
+  // original (missing or existing) journal is left untouched.
+  try {
+    fs.linkSync(tmp, journalPath);
+  } catch (error) {
+    try { fs.unlinkSync(tmp); } catch { /* best-effort */ }
+    if (error.code === 'EEXIST') {
+      const existing = readPendingJournal(recordFile);
+      if (existing.status === 'ok' && existing.entry &&
+          existing.entry.txHash === entry.txHash &&
+          existing.entry.operation === entry.operation &&
+          existing.entry.operationId === entry.operationId) {
+        const existingStr = JSON.stringify(existing.entry);
+        const newStr = JSON.stringify(entry);
+        if (existingStr === newStr) {
+          return journalPath;
+        }
+        throw new Error('cannot persist journal: same operation ID but different payload.');
+      }
+      if (existing.status === 'terminal_failure') {
+        throw new Error('cannot persist journal: an unresolved terminal failure journal already exists at ' + journalPath + '. Resolve it manually.');
+      }
+      throw new Error('cannot persist journal: an unresolved journal already exists at ' + journalPath + '.');
+    }
+    throw new Error('cannot publish journal at ' + journalPath + ': ' + error.message);
+  } finally {
+    try { fs.unlinkSync(tmp); } catch { /* best-effort cleanup of temp */ }
+  }
+  fsyncDirectory(directory);
+  return journalPath;
+}
+
+function persistTerminalFailure(recordFile, failureEvidence) {
+  const directory = path.dirname(recordFile);
+  fs.mkdirSync(directory, { recursive: true });
+  const journalPath = recordFile + '.journal';
+  const existing = readPendingJournal(recordFile);
+  if (existing.status === 'terminal_failure') {
+    return journalPath; // already recorded
+  }
+  if (existing.status !== 'ok' || !existing.entry) {
+    throw new Error('cannot persist terminal failure: journal is missing or unreadable');
+  }
+  const entry = {
+    ...existing.entry,
+    status: 'failed',
+    failedAt: new Date().toISOString(),
+    failure: failureEvidence || {},
+    receipt: {
+      transactionHash: existing.entry.txHash,
+      ...(failureEvidence && failureEvidence.receipt ? failureEvidence.receipt : {}),
+    },
+  };
+  const tmp = `${journalPath}.fail-${process.pid}-${Date.now()}`;
+  const fd = fs.openSync(tmp, 'wx', FILE_MODE);
+  try {
+    const data = `${JSON.stringify(entry, null, 2)}\n`;
+    let written = 0;
+    while (written < data.length) {
+      const n = fs.writeSync(fd, data, written);
+      if (n <= 0) throw new Error('failed to write full journal payload');
+      written += n;
+    }
+    fs.fsyncSync(fd);
+  } catch (error) {
+    try { fs.closeSync(fd); } catch { /* best-effort */ }
+    try { fs.unlinkSync(tmp); } catch { /* best-effort */ }
+    throw new Error('cannot write terminal failure journal: ' + error.message);
+  }
+  try { fs.closeSync(fd); } catch { /* best-effort */ }
+  try {
+    fs.chmodSync(tmp, FILE_MODE);
   } catch {
     // best-effort
   }
+  // Same-operation atomic replace (rename over the existing pending journal).
+  try {
+    fs.renameSync(tmp, journalPath);
+  } catch (error) {
+    try { fs.unlinkSync(tmp); } catch { /* best-effort */ }
+    throw new Error('cannot publish terminal failure journal: ' + error.message);
+  }
+  fsyncDirectory(directory);
   return journalPath;
 }
 
@@ -256,6 +366,9 @@ function clearPendingJournal(recordFile, expectedOpId, expectedTxHash) {
     return;
   }
   const existing = readPendingJournal(recordFile);
+  if (existing.status === 'terminal_failure') {
+    throw new Error('cannot clear a failed transaction journal; resolve the terminal failure manually');
+  }
   if (existing.status !== 'ok' || !existing.entry) {
     throw new Error('cannot clear journal: journal is malformed or unreadable');
   }
@@ -267,9 +380,11 @@ function clearPendingJournal(recordFile, expectedOpId, expectedTxHash) {
   }
   try {
     fs.unlinkSync(journalPath);
-  } catch {
-    // best-effort
+  } catch (error) {
+    throw new Error(`failed to remove journal at ${journalPath}: ${error.message}`);
   }
+  // Best-effort directory fsync to make the deletion durable.
+  fsyncDirectory(path.dirname(journalPath));
 }
 
 function validateDeploymentTransaction(signed, journal, expectedDeployer, expectedInitcode, expectedNonce) {
@@ -343,6 +458,7 @@ module.exports = {
   persistPendingEntry,
   readPendingJournal,
   clearPendingJournal,
+  persistTerminalFailure,
   validateDeploymentTransaction,
   validateBindingTransaction,
 };

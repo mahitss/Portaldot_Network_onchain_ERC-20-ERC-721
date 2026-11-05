@@ -12,7 +12,7 @@ npm run check:funding
 ```
 
 `npm run check` compiles, regenerates the SDK ABI, and runs all three test suites (72 contract
-tests, 13 SDK tests, 178 release-safety tests including 52 offline lifecycle/recovery tests).
+tests, 13 SDK tests, 182 release-safety tests including 53 offline lifecycle/recovery tests).
 `npm run check:funding` must report `funded: true` before anything else.
 
 ## 1. Deploy and bind (one command)

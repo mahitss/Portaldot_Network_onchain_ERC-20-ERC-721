@@ -22,7 +22,21 @@ function writeJsonAtomic(file, value) {
   const directory = path.dirname(file);
   fs.mkdirSync(directory, { recursive: true });
   const tmp = `${file}.tmp-${process.pid}-${Date.now()}-${writeCounter++}`;
-  fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`);
+  // Write the temporary file and fsync it before the atomic rename so an
+  // interrupted run never leaves a half-written replacement visible.
+  const fd = fs.openSync(tmp, 'w', 0o600);
+  try {
+    const data = `${JSON.stringify(value, null, 2)}\n`;
+    let written = 0;
+    while (written < data.length) {
+      const n = fs.writeSync(fd, data, written);
+      if (n <= 0) throw new Error('failed to write full record payload');
+      written += n;
+    }
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
   try {
     fs.renameSync(tmp, file);
   } catch (error) {
@@ -32,6 +46,16 @@ function writeJsonAtomic(file, value) {
       // the tmp file is best-effort removed; the original record is intact
     }
     throw new Error(`atomic record write failed for ${file}: ${error.message}`);
+  }
+  // Best-effort directory fsync so the rename is durable where supported.
+  // Not all filesystems/platforms support directory fsync; failure here is
+  // not fatal but the file is valid once the rename completes.
+  try {
+    const dirFd = fs.openSync(directory, 'r');
+    fs.fsyncSync(dirFd);
+    fs.closeSync(dirFd);
+  } catch {
+    // directory fsync unsupported; rename still provides atomic visibility
   }
 }
 

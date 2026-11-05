@@ -893,11 +893,40 @@ async function runRelease({
         const rpcError = null; // would be set if query threw
         const state = classifyRecoveryState(existingReceipt, knownTx, rpcError);
         if (state === MINED_FAILURE) {
-          stderr.write(`\\n${name}: transaction mined but FAILED; preserving journal for manual recovery\\n`);
-          continue;
+          const { persistTerminalFailure } = require('./lib/transaction-journal.cjs');
+          persistTerminalFailure(recordFile, {
+            receipt: {
+              transactionHash: existingReceipt.transactionHash,
+              status: existingReceipt.status,
+              blockNumber: existingReceipt.blockNumber,
+              contractAddress: existingReceipt.contractAddress ?? null,
+            },
+          });
+          throw new Error(
+            `transaction for ${name} was mined but failed (status ${existingReceipt.status ?? 'unknown'}); terminal failure evidence retained in the journal. Manual intervention is required; refusing to proceed.`
+          );
         }
         if (state === MINED_SUCCESS) {
-          // Already confirmed — reconcile without rebroadcast.
+          validateReceipt(entry.txHash, existingReceipt);
+          if (!Number.isSafeInteger(existingReceipt.blockNumber) || existingReceipt.blockNumber < 0) {
+            throw new Error(
+              `cannot reconcile ${name}: the receipt for ${entry.txHash} has an invalid block number ${String(existingReceipt.blockNumber)}; refusing to reuse or redeploy`
+            );
+          }
+          if (
+            typeof existingReceipt.contractAddress !== 'string' ||
+            !/^0x[0-9a-fA-F]{40}$/.test(existingReceipt.contractAddress)
+          ) {
+            throw new Error(
+              `cannot reconcile ${name}: the receipt for ${entry.txHash} has no valid contract-creation address; refusing to reuse or redeploy`
+            );
+          }
+          const code = await probes.code(existingReceipt.contractAddress);
+          if (typeof code !== 'string' || code === '0x') {
+            throw new Error(
+              `cannot reconcile ${name}: the receipt reports success but no bytecode exists at ${existingReceipt.contractAddress}; the outcome is ambiguous, refusing to reuse or redeploy`
+            );
+          }
           record.contracts[name] = {
             address: existingReceipt.contractAddress,
             txHash: entry.txHash,
@@ -908,6 +937,17 @@ async function runRelease({
           syncTokens(record, config.tokenConfig);
           record.updatedAt = new Date().toISOString();
           recordIo.write(recordFile, record);
+          const verifyLoaded = recordIo.read(recordFile);
+          if (
+            verifyLoaded.status !== 'ok' ||
+            !verifyLoaded.data ||
+            !verifyLoaded.data.contracts ||
+            !verifyLoaded.data.contracts[name] ||
+            verifyLoaded.data.contracts[name].status !== 'confirmed' ||
+            String(verifyLoaded.data.contracts[name].txHash).toLowerCase() !== String(entry.txHash).toLowerCase()
+          ) {
+            throw new Error(`failed to verify persisted record for ${name}; journal preserved for recovery`);
+          }
           reuseNotes.push(`${name}: already mined, reconciled without rebroadcast`);
           stderr.write(`\\n${name}: already mined, reconciled without rebroadcast\\n`);
           const opId = journal.entry.operationId;
@@ -916,13 +956,14 @@ async function runRelease({
         }
         // Check if transaction is known but pending (already queried above).
         if (state === KNOWN_PENDING) {
-          // Transaction is known but not mined — preserve pending state, do not replace.
-          stderr.write(`\\n${name}: transaction known but pending, preserving state\\n`);
-          continue;
+          throw new Error(
+            `transaction for ${name} is known but not yet mined; the original journal is preserved. Refusing to proceed or sign any new transaction until the outcome is known.`
+          );
         }
         if (state === AMBIGUOUS) {
-          stderr.write(`\\n${name}: recovery state ambiguous; preserving journal\\n`);
-          continue;
+          throw new Error(
+            `recovery of ${name} is ambiguous; the journal and record are preserved. Refusing to proceed or sign any new transaction until the outcome is known.`
+          );
         }
         // Only rebroadcast if transaction is unknown.
         const broadcast = await rebroadcastTx(signedTx);
@@ -962,10 +1003,22 @@ async function runRelease({
         syncTokens(record, config.tokenConfig);
         record.updatedAt = new Date().toISOString();
         recordIo.write(recordFile, record);
+        // Read back and verify the persisted record before clearing the journal.
+        const verifyLoaded = recordIo.read(recordFile);
+        if (
+          verifyLoaded.status !== 'ok' ||
+          !verifyLoaded.data ||
+          !verifyLoaded.data.contracts ||
+          !verifyLoaded.data.contracts[name] ||
+          verifyLoaded.data.contracts[name].status !== 'confirmed' ||
+          String(verifyLoaded.data.contracts[name].txHash).toLowerCase() !== String(entry.txHash).toLowerCase() ||
+          String(verifyLoaded.data.contracts[name].address).toLowerCase() !== String(receipt.contractAddress).toLowerCase()
+        ) {
+          throw new Error(`failed to verify persisted record for ${name}; journal preserved for recovery`);
+        }
         reuseNotes.push(`${name}: rebroadcast journaled transaction ${entry.txHash} (no new transaction)`);
         stderr.write(`\n${name}: rebroadcast journaled transaction ${entry.txHash}\n`);
-        const j2 = readPendingJournal(recordFile);
-        const opId = (j2.status === 'ok' && j2.entry) ? j2.entry.operationId : null;
+        const opId = journal.entry.operationId;
         clearPendingJournal(recordFile, opId, entry.txHash);
       } else {
         record.contracts[name] = await reconcilePendingEntry(name, entry, probes);

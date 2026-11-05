@@ -35,6 +35,18 @@ function checkJournalGate(recordFile, recordIo) {
     };
   }
 
+  // A terminal failure journal means an on-chain transaction was mined but
+  // reverted. Manual inspection is required; never proceed automatically.
+  if (journalResult.status === 'terminal_failure') {
+    return {
+      blocked: true,
+      journal: journalResult.entry,
+      reason:
+        `a failed transaction was mined (txHash: ${journalResult.entry.txHash}). ` +
+        'The failure evidence is preserved in the journal and must be resolved manually before any new release can be signed.',
+    };
+  }
+
   const journal = journalResult.entry;
 
   // Validate schema version.

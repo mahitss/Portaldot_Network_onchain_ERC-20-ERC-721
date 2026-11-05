@@ -1350,6 +1350,96 @@ test('Objective B: crash before broadcast - journaled pending entry rebroadcast 
   assert.equal(final.contracts.PotERC20.blockNumber, 42);
 });
 
+test('deployment recovery uses artifact-based reconstructInitcodes (no DI override)', async () => {
+  const recordFile = tempFile();
+  const { ethers, Interface } = await import('ethers');
+  const wallet = ethers.Wallet.createRandom();
+  const artifact = JSON.parse(fs.readFileSync(path.join(root, 'artifacts', 'contracts', 'PotERC20.sol', 'PotERC20.json'), 'utf8'));
+  const iface = new Interface(artifact.abi);
+  const encodedArgs = iface.encodeDeploy(['Custom Token', 'CUSTOM', wallet.address]);
+  const expectedInitcode = artifact.bytecode + encodedArgs.slice(2);
+  const txRequest = { data: expectedInitcode, gasLimit: 1000000n, chainId: CHAIN_ID, nonce: 0, maxFeePerGas: 1000n, maxPriorityFeePerGas: 100n };
+  const signedTx = await wallet.signTransaction(txRequest);
+  const txHash = ethers.Transaction.from(signedTx).hash;
+
+  // Build a record with PotERC20 pending (crashed before broadcast), ERC721
+  // and PotRegistry confirmed; the real deployer is the ephemeral wallet.
+  const rec = JSON.parse(JSON.stringify(existingRecord));
+  const walletCommitment = `0x${createHash('sha256').update(Buffer.from(`${wallet.address.slice(2)}${'ee'.repeat(12)}`, 'hex')).digest('hex')}`;
+  rec.deployer = wallet.address.toLowerCase();
+  rec.releasePlan = {
+    ...rec.releasePlan,
+    deployer: wallet.address.toLowerCase(),
+    tokenConfig: { ...rec.releasePlan.tokenConfig, erc20Name: 'Custom Token', erc20Symbol: 'CUSTOM' },
+    nativeAccountHash: walletCommitment,
+  };
+  rec.contracts.PotERC20 = { txHash, gasLimit: '1000000', status: 'pending' };
+  const recordIo = makeRecordIo(rec);
+
+  // Persist a journal with the full artifact initcode as expectedData
+  const { persistPendingEntry } = await import('../lib/transaction-journal.cjs');
+  persistPendingEntry(recordFile, {
+    schemaVersion: 1,
+    operationId: 'test-op-real-artifact',
+    operation: 'deploy',
+    contract: 'PotERC20',
+    txHash,
+    signed: signedTx,
+    expectedSender: wallet.address,
+    chainId: CHAIN_ID,
+    nonce: 0,
+    expectedTo: null,
+    expectedValue: '0',
+    expectedData: expectedInitcode,
+    createdAt: new Date().toISOString(),
+    attempts: 1,
+    status: 'pending',
+    params: { artifact: 'PotERC20', gasLimit: '1000000', args: ['Custom Token', 'CUSTOM', wallet.address] },
+  });
+
+  const planEnv = {
+    ...probeEnv(),
+    POT_ERC20_NAME: 'Custom Token',
+    POT_ERC20_SYMBOL: 'CUSTOM',
+    // no ERC721 overrides — plan uses the defaults (Portaldot Pot Collectibles / POTC)
+  };
+  // probes2: PotERC20 receipt absent (triggers rebroadcast of exact bytes)
+  // PotERC721/PotRegistry provably confirmed via default receipts/bytecode.
+  const probes2 = makeProbes({
+    evmBalance: 10_000n * 10n ** 18n,
+    nativeFree: 10_000n * 10n ** 14n,
+    codes: {
+      [TOKEN_ERC20]: `0x${'ff'.repeat(200)}`,
+      [TOKEN_ERC721]: `0x${'ff'.repeat(200)}`,
+      [REGISTRY_ADDR]: `0x${'ff'.repeat(200)}`,
+    },
+    receipts: {},               // PotERC20 absent on this probe
+    txs: {},
+  });
+  let rebroadcastCount = 0;
+  const rebroadcastTx = async (signed) => {
+    rebroadcastCount += 1;
+    return { receipt: { status: 1, blockNumber: 42, transactionHash: txHash, contractAddress: TOKEN_ERC20 }, address: TOKEN_ERC20 };
+  };
+  const result = await runRelease({
+    env: planEnv,
+    deployerAddress: wallet.address,
+    recordIo,
+    probes: probes2,
+    deployContract: async () => { throw new Error('must not be called'); },
+    recordFile,
+    networkName: NETWORK,
+    chainId: CHAIN_ID,
+    rebroadcastTx,
+    // IMPORTANT: no expectedInitcodes DI override — recovery must reconstruct
+    // the initcode from the real artifact and release plan.
+  });
+  assert.equal(rebroadcastCount, 1, 'exact original bytes rebroadcast after artifact reconstruction');
+  const final = recordIo.state();
+  assert.equal(final.contracts.PotERC20.status, 'confirmed');
+  assert.equal(final.contracts.PotERC20.txHash, txHash, 'same txHash reused; no replacement transaction');
+});
+
 test('deployment recovery: tampered journal expectedData is rejected before rebroadcast; zero rebroadcast, journal retained', async () => {
   const recordFile = tempFile();
   const recordIo = makeRecordIo(null);
