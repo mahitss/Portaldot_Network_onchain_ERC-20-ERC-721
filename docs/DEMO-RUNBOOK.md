@@ -12,7 +12,7 @@ npm run check:funding
 ```
 
 `npm run check` compiles, regenerates the SDK ABI, and runs all three test suites (72 contract
-tests, 13 SDK tests, 115 release-safety tests including 20 offline lifecycle/recovery tests).
+tests, 13 SDK tests, 178 release-safety tests including 52 offline lifecycle/recovery tests).
 `npm run check:funding` must report `funded: true` before anything else.
 
 ## 1. Deploy and bind (one command)
@@ -39,18 +39,34 @@ step) for on-chain proof.
 
 ### Retry and recovery
 
-The release is safe to rerun after an interruption:
+The release is safe to rerun after an interruption. A side-car **transaction journal**
+(`deployments/<network>.json.journal`) holds the exact signed bytes of any unconfirmed
+transaction, written before broadcast with owner-only (0o600) permissions. The deployment
+JSON never contains signed bytes.
 
-- If a deployment transaction was sent but its receipt was not persisted, the
-  next run reconciles the pending entry from the chain receipt instead of
-  redeploying (crash-after-send recovery).
-- If a receipt cannot be found, the outcome is treated as ambiguous and the
-  run fails closed — nothing is redeployed.
-- If one of the two bindings already succeeded, rerunning `bind:testnet`
-  verifies it against the intended configuration and sends only the missing
-  binding.
-- A deliberately fresh deployment requires `POT_FORCE_FRESH_RELEASE=1` and
-  archives (never deletes) the previous record.
+On an interrupted rerun, before any new signing, the pending entry is validated against an
+independent reconstruction — deployment initcode rebuilt from the compiled artifacts and the
+immutable release plan (bytecode + ABI-encoded constructor arguments), binding calldata
+re-encoded from the validated record and registry ABI. The rebroadcast is refused unless the
+journal transaction cryptographically matches that independently reconstructed intent:
+
+- A receipt matching the transaction confirms it without rebroadcast. A confirmed receipt is
+  reused and the journal is cleared only after the record is durably persisted and re-read.
+- A mined but **failed** transaction is terminal: it is never rebroadcast, and the journal
+  is retained for manual intervention.
+- A transaction known but not yet mined is left alone; no replacement is ever sent.
+- An **unknown** transaction is rebroadcast as the exact original signed bytes only after
+  complete identity validation; an ambiguous or malformed RPC answer preserves the journal and
+  aborts.
+- A malformed or tampered journal/record pair aborts before any signing.
+- If one of the two bindings already succeeded, rerunning `bind:testnet` verifies it against
+  the intended configuration and sends only the missing binding.
+- A deliberately fresh deployment requires `POT_FORCE_FRESH_RELEASE=1` and archives (never
+  deletes) the previous record.
+
+After an interrupted release, do not delete the journal or the deployment record; inspect
+them and rerun. Manual intervention is required for failed or consistently ambiguous
+transactions.
 
 Before running, you must set the native binding IDs:
 

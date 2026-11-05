@@ -416,7 +416,23 @@ async function runBinding({
         const registryArtifact = requireRegistryArtifact();
         const registryInterface = new Interface(registryArtifact.abi);
         // Find the intended call for this entry's token from the record.
-        const tokenEntryKey = entry.token.toLowerCase() === String(record.tokens.erc20.address).toLowerCase() ? 'erc20' : 'erc721';
+        // Strict identity match against the validated record token addresses;
+        // unknown or ambiguous tokens fail closed (never fall back to a
+        // default binding target).
+        const erc20Lower = String(record.tokens.erc20.address).toLowerCase();
+        const erc721Lower = String(record.tokens.erc721.address).toLowerCase();
+        const entryTokenLower = String(entry.token).toLowerCase();
+        if (erc20Lower === erc721Lower) {
+          throw new Error('deployment record erc20 and erc721 token addresses are identical; binding cannot be attributed to either token');
+        }
+        let tokenEntryKey = null;
+        if (entryTokenLower === erc20Lower) {
+          tokenEntryKey = 'erc20';
+        } else if (entryTokenLower === erc721Lower) {
+          tokenEntryKey = 'erc721';
+        } else {
+          throw new Error('pending binding token ' + entry.token + ' does not match any recorded token address; refusing to reconstruct binding intent');
+        }
         const intendedCall = intendedCalls.find((c) => c.tokens === tokenEntryKey);
         if (!intendedCall) {
           throw new Error('cannot reconstruct binding intent for ' + entry.token + ': no intended call found');
@@ -454,7 +470,7 @@ async function runBinding({
           }
           pendingReconciled += 1;
           stderr.write(`\\nbinding for ${entry.token}: already mined, reconciled without rebroadcast\\n`);
-          const opId = validationJournal.entry.operationId;
+          const opId = journal.entry.operationId;
           clearPendingJournal(recordFile, opId, entry.txHash);
           continue;
         }

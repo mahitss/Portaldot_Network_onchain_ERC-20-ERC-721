@@ -156,6 +156,9 @@ function readPendingJournal(recordFile) {
     if (parsed.nonce === undefined || parsed.nonce === null) {
       return { status: 'malformed', entry: null, error: 'missing nonce' };
     }
+    if (!isCanonicalNonce(parsed.nonce)) {
+      return { status: 'malformed', entry: null, error: 'journal nonce is not a canonical non-negative integer' };
+    }
     if (parsed.operation !== 'deploy' && parsed.operation !== 'bind') {
       return { status: 'malformed', entry: null, error: 'invalid operation type: ' + parsed.operation };
     }
